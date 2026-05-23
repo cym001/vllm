@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
@@ -143,6 +143,67 @@ class TestGetKVConnectorKVCacheEvents:
             assert event.block_hashes == [f"hash{i}"]
             assert event.parent_block_hash == f"parent{i}"
             assert event.token_ids == [i]
+
+    def test_converts_remove_event(self, mock_connector):
+        """Test conversion of a remove event from lmcache engine format."""
+
+        class MockRemoveEvent:
+            def __init__(self):
+                self.block_hashes = ["hash_removed_1", "hash_removed_2"]
+                self.medium = "cpu"
+                self.group_idx = None
+
+        mock_connector._lmcache_engine.get_kv_events.return_value = [
+            MockRemoveEvent()
+        ]
+
+        result = mock_connector.get_kv_connector_kv_cache_events()
+
+        assert result is not None
+        assert isinstance(result, LMCacheKVEvents)
+
+        events = result.get_all_events()
+        assert len(events) == 1
+        assert isinstance(events[0], BlockRemoved)
+        assert events[0].block_hashes == ["hash_removed_1", "hash_removed_2"]
+        assert events[0].medium == "cpu"
+        assert events[0].group_idx is None
+
+    def test_converts_mixed_store_and_remove_events(self, mock_connector):
+        """Test conversion of mixed store and remove events."""
+
+        class MockStoreEvent:
+            def __init__(self):
+                self.block_hashes = ["hash_stored"]
+                self.parent_block_hash = "parent_hash"
+                self.token_ids = [1, 2, 3]
+                self.lora_id = None
+                self.block_size = 16
+                self.medium = "GPU"
+                self.lora_name = None
+
+        class MockRemoveEvent:
+            def __init__(self):
+                self.block_hashes = ["hash_removed"]
+                self.medium = "cpu"
+                self.group_idx = None
+
+        mock_connector._lmcache_engine.get_kv_events.return_value = [
+            MockStoreEvent(),
+            MockRemoveEvent(),
+        ]
+
+        result = mock_connector.get_kv_connector_kv_cache_events()
+
+        assert result is not None
+        events = result.get_all_events()
+        assert len(events) == 2
+        assert isinstance(events[0], BlockStored)
+        assert events[0].block_hashes == ["hash_stored"]
+        assert isinstance(events[1], BlockRemoved)
+        assert events[1].block_hashes == ["hash_removed"]
+        assert events[1].medium == "cpu"
+        assert events[1].group_idx is None
 
     def test_preserves_event_attributes(self, mock_connector):
         """Test that all event attributes are correctly preserved."""
