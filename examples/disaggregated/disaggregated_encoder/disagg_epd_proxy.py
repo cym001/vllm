@@ -173,6 +173,28 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, dict]) -> dict:
     return {**req_data, "messages": new_messages}
 
 
+async def send_encoder_request(
+    target_url: str, encoder_req: dict, headers: dict[str, str]
+) -> tuple[int, str]:
+    """Send one encoder request under the process-wide inflight limit."""
+
+    async def _send() -> tuple[int, str]:
+        assert encode_session is not None
+        async with encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        ) as response:
+            body = await response.read()
+            return response.status, body.decode("utf-8", errors="replace")
+
+    semaphore: asyncio.Semaphore | None = app.state.encoder_semaphore
+    if semaphore is None:
+        return await _send()
+    async with semaphore:
+        return await _send()
+
+
 def extract_mm_items(request_data: dict) -> list[dict]:
     """
     Return *all* image/audio/video items that appear anywhere in `messages`.
@@ -257,13 +279,7 @@ async def fanout_encoder_primer(
             # once the prompt is encoded and its embeddings are published.
             "stream": False,
         }
-        tasks.append(
-            encode_session.post(
-                f"{target_url}/v1/chat/completions",
-                json=encoder_req,
-                headers=headers,
-            )
-        )
+        tasks.append(send_encoder_request(target_url, encoder_req, headers))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -280,20 +296,17 @@ async def fanout_encoder_primer(
             raise HTTPException(
                 status_code=502, detail=f"Encoder request failed: {str(r)}"
             )
-        if r.status != 200:
-            try:
-                detail = await r.text()
-            except Exception:
-                detail = "<unable to read body>"
+        status, detail = r
+        if status != 200:
             logger.error(
                 "[%s] Encoder request #%d returned status %s: %s",
                 req_id,
                 idx,
-                r.status,
+                status,
                 detail,
             )
             raise HTTPException(
-                status_code=r.status,
+                status_code=status,
                 detail=f"Encoder request failed: {detail}",
             )
 
@@ -454,6 +467,10 @@ async def on_startup() -> None:
         # only setup if prefill instance(s) exist
         prefill_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     decode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    max_encoder_inflight = app.state.max_encoder_inflight
+    app.state.encoder_semaphore = (
+        asyncio.Semaphore(max_encoder_inflight) if max_encoder_inflight > 0 else None
+    )
 
 
 @app.on_event("shutdown")
@@ -763,6 +780,12 @@ if __name__ == "__main__":
         required=True,
         help='Comma-separated decode URLs ("http://d1:8005,http://d2:8006")',
     )
+    parser.add_argument(
+        "--max-encoder-inflight",
+        type=int,
+        default=0,
+        help="Maximum concurrent Proxy-to-Encoder requests (0 means unlimited)",
+    )
 
     args = parser.parse_args()
     NO_REWRITE = args.no_rewrite
@@ -772,6 +795,7 @@ if __name__ == "__main__":
     app.state.d_urls = [
         u.strip() for u in args.decode_servers_urls.split(",") if u.strip()
     ]
+    app.state.max_encoder_inflight = max(0, args.max_encoder_inflight)
     # handle prefill instances
     if args.prefill_servers_urls.lower() in ("disable", "none", ""):
         app.state.p_urls = []
@@ -786,6 +810,7 @@ if __name__ == "__main__":
 
     logger.info("Proxy listening on %s:%s", args.host, args.port)
     logger.info("Encode servers: %s", app.state.e_urls)
+    logger.info("Maximum encoder inflight: %s", app.state.max_encoder_inflight or "unlimited")
     logger.info("Prefill instances %s", app.state.p_urls)
     logger.info("Decode servers: %s", app.state.d_urls)
 
