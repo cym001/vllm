@@ -15,6 +15,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.ec_transfer.ec_connector.base import ECCacheAvailability
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -3033,6 +3034,87 @@ def test_ec_connector_cache_miss_computes_locally(use_kv_connector):
     )
 
     # Then MODEL_RUNNER will execute the encoder and cache the result
+
+
+def test_strict_ec_pending_does_not_block_later_ready_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=200,
+        mm_hashes_list=[["pending_hash"], ["ready_hash"]],
+        mm_positions=[
+            [PlaceholderRange(offset=0, length=100)],
+            [PlaceholderRange(offset=0, length=100)],
+        ],
+    )
+    availability = {
+        "pending_hash": ECCacheAvailability.PENDING,
+        "ready_hash": ECCacheAvailability.READY,
+    }
+    scheduler.ec_connector.get_cache_availability = Mock(
+        side_effect=lambda identifier: availability[identifier]
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        requests[1].request_id
+    ]
+    assert requests[0].request_id not in output.num_scheduled_tokens
+    assert requests[0].status == RequestStatus.WAITING
+
+    availability["pending_hash"] = ECCacheAvailability.READY
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        requests[0].request_id
+    ]
+
+
+def test_strict_ec_async_load_uses_transfer_only_step_before_prefill():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["async_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    staged = False
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.READY
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.ec_connector.supports_async_load = Mock(return_value=True)
+    scheduler.ec_connector.is_async_load_finished = Mock(
+        side_effect=lambda identifier: staged
+    )
+    scheduler.add_request(request)
+
+    transfer_output = scheduler.schedule()
+
+    assert transfer_output.total_num_scheduled_tokens == 0
+    assert transfer_output.scheduled_new_reqs == []
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_ECS
+    assert request.request_id in scheduler.pending_ec_loads
+
+    staged = True
+    prefill_output = scheduler.schedule()
+
+    assert prefill_output.num_scheduled_tokens[request.request_id] == 200
+    assert request.status == RequestStatus.RUNNING
+    assert request.request_id not in scheduler.pending_ec_loads
 
 
 @pytest.mark.parametrize("use_kv_connector", [False, True])

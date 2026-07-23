@@ -4,6 +4,7 @@
 Define EC connector functionality mixin for model runners.
 """
 
+import copy
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -13,7 +14,11 @@ import torch
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
 from vllm.logger import init_logger
-from vllm.v1.outputs import ECConnectorOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    ECConnectorOutput,
+    ModelRunnerOutput,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -23,6 +28,24 @@ logger = init_logger(__name__)
 
 # Defined as a EC connector functionality mixin for ModelRunner (GPU, TPU)
 class ECConnectorModelRunnerMixin:
+    @staticmethod
+    def ec_connector_no_forward(
+        scheduler_output: "SchedulerOutput",
+        encoder_cache: dict[str, torch.Tensor],
+    ) -> ModelRunnerOutput:
+        with ECConnectorModelRunnerMixin.maybe_get_ec_connector_output(
+            scheduler_output, encoder_cache
+        ) as ec_connector_output:
+            pass
+        if ec_connector_output is None or (
+            not ec_connector_output.finished_sending
+            and not ec_connector_output.finished_recving
+        ):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.ec_connector_output = ec_connector_output
+        return output
+
     @staticmethod
     def maybe_save_ec_to_connector(
         encoder_cache: dict[str, torch.Tensor],
