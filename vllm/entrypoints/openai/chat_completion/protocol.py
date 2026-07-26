@@ -184,6 +184,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
+    # Opaque, non-media CedFS references attached by a trusted E-PD proxy.
+    # The EC connector resolves the matching object; the OpenAI layer does not
+    # dereference or log the original media.
+    cedfs_cache_refs: list[dict[str, Any]] | None = None
     model: str | None = None
     frequency_penalty: float | None = 0.0
     logit_bias: dict[str, float] | None = None

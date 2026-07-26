@@ -1305,7 +1305,13 @@ class Scheduler(SchedulerInterface):
                     external_load_encoder_input.append(i)
                     num_embeds_to_schedule += num_encoder_embeds
                     continue
-                if self.ec_connector.requires_external_cache():
+                # PENDING means the externally produced object may still become
+                # usable. FAILED is terminal for this lookup round and must
+                # converge to local recompute instead of blocking forever.
+                if (
+                    self.ec_connector.requires_external_cache()
+                    and availability == ECCacheAvailability.PENDING
+                ):
                     if num_computed_tokens + shift_computed_tokens < start_pos:
                         num_new_tokens = start_pos - (
                             num_computed_tokens + shift_computed_tokens

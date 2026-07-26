@@ -21,16 +21,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import copy
+import hashlib
+import io
 import logging
 import os
 import random
 import uuid
 from collections.abc import AsyncIterator
+from urllib.request import urlopen
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 
 ###############################################################################
 # FastAPI app & global state
@@ -52,6 +58,89 @@ decode_session: aiohttp.ClientSession | None = None
 
 
 MM_TYPES = {"image_url", "audio_url", "input_audio"}
+_BLANK_AUDIO = (
+    "data:audio/wav;base64,"
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="
+)
+
+
+def _media_identifier(item: dict) -> str:
+    media = item.get(item.get("type"))
+    payload = repr(media).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def assign_mm_identifiers(request_data: dict) -> list[str]:
+    identifiers = []
+    for item in extract_mm_items(request_data):
+        identifier = str(item.get("uuid") or _media_identifier(item))
+        item["uuid"] = identifier
+        identifiers.append(identifier)
+    return identifiers
+
+
+def _blank_image_url(original: str) -> str:
+    if original.startswith("data:"):
+        encoded = original.split(",", 1)[1]
+        source = base64.b64decode(encoded)
+        image = Image.open(io.BytesIO(source))
+    else:
+        with urlopen(original, timeout=30) as response:  # noqa: S310 - trusted edge
+            image = Image.open(io.BytesIO(response.read()))
+    blank = Image.new("RGB", image.size)
+    output = io.BytesIO()
+    blank.save(output, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
+
+
+def sanitize_for_pd(request_data: dict, cache_refs: list[dict]) -> dict:
+    """Replace raw media with shape-preserving synthetic inputs and cache refs."""
+    sanitized = copy.deepcopy(request_data)
+    refs = {ref["mm_hash"]: ref for ref in cache_refs}
+    for item in extract_mm_items(sanitized):
+        identifier = str(item["uuid"])
+        if identifier not in refs:
+            raise ValueError(f"missing cache_ref for multimodal item {identifier}")
+        if item["type"] == "image_url":
+            value = item["image_url"]
+            url = value["url"] if isinstance(value, dict) else value
+            blank_url = _blank_image_url(str(url))
+            item["image_url"] = (
+                {**value, "url": blank_url} if isinstance(value, dict) else blank_url
+            )
+        elif item["type"] == "audio_url":
+            item["audio_url"] = _BLANK_AUDIO
+        else:
+            item["input_audio"] = {"data": _BLANK_AUDIO.split(",", 1)[1], "format": "wav"}
+    sanitized["cedfs_cache_refs"] = cache_refs
+    return sanitized
+
+
+def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
+    client = getattr(app.state, "cedfs_client", None)
+    scopes = getattr(app.state, "candidate_scopes", [])
+    if not identifiers:
+        return []
+    if client is None or not scopes:
+        raise RuntimeError("CedFS cache_ref resolver is not configured")
+    values = client.batch_find_first_ready(scopes, identifiers, [])
+    refs = []
+    for identifier in identifiers:
+        value = values.get(identifier)
+        if not value:
+            raise RuntimeError(f"no READY CedFS candidate for {identifier}")
+        meta = value["meta"]
+        refs.append(
+            {
+                "version": 1,
+                "mm_hash": identifier,
+                "model_scope": value["model_scope"],
+                "sha256": meta["sha256"],
+                "num_encoder_token": meta.get("num_encoder_token"),
+                "ino": (value.get("location") or {}).get("ino"),
+            }
+        )
+    return refs
 
 
 async def send_encoder_request(
@@ -99,7 +188,7 @@ async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
     req_id: str,
-) -> None:
+) -> list[str]:
     """
     1. Build one request *per MM item* with all text removed.
     2. Send them concurrently to the encode cluster.
@@ -110,7 +199,7 @@ async def fanout_encoder_primer(
     mm_items = extract_mm_items(orig_request)
     if not mm_items:
         logger.info("[%s] No multimodal items, skipping encoder", req_id)
-        return  # nothing to do
+        return []  # nothing to do
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
@@ -168,6 +257,7 @@ async def fanout_encoder_primer(
     logger.info(
         "[%s] All %d encoder requests completed successfully", req_id, len(mm_items)
     )
+    return [str(item["uuid"]) for item in mm_items]
 
 
 async def maybe_prefill(
@@ -337,7 +427,10 @@ async def forward_non_stream(
 ) -> dict:
     try:
         # Step 1: Process through Encoder instance (if has MM input)
-        await fanout_encoder_primer(req_data, e_urls, req_id)
+        assign_mm_identifiers(req_data)
+        identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
+        if identifiers:
+            req_data = sanitize_for_pd(req_data, resolve_cache_refs(identifiers))
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -365,7 +458,10 @@ async def forward_stream(
 ) -> AsyncIterator[str]:
     try:
         # Step 1: Process through Encoder instance (if has MM input)
-        await fanout_encoder_primer(req_data, e_urls, req_id)
+        assign_mm_identifiers(req_data)
+        identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
+        if identifiers:
+            req_data = sanitize_for_pd(req_data, resolve_cache_refs(identifiers))
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -594,6 +690,15 @@ if __name__ == "__main__":
         default=0,
         help="Maximum concurrent Proxy-to-Encoder requests (0 means unlimited)",
     )
+    parser.add_argument(
+        "--cedfs-config",
+        help="CedFS client TOML used by the proxy-side cache_ref resolver",
+    )
+    parser.add_argument(
+        "--candidate-scopes",
+        default="",
+        help="Ordered comma-separated compatible producer scopes",
+    )
 
     args = parser.parse_args()
     app.state.e_urls = [
@@ -603,6 +708,14 @@ if __name__ == "__main__":
         u.strip() for u in args.decode_servers_urls.split(",") if u.strip()
     ]
     app.state.max_encoder_inflight = max(0, args.max_encoder_inflight)
+    app.state.candidate_scopes = [
+        scope.strip() for scope in args.candidate_scopes.split(",") if scope.strip()
+    ]
+    app.state.cedfs_client = None
+    if args.cedfs_config:
+        from cedfs_ec._native import CedfsECClient
+
+        app.state.cedfs_client = CedfsECClient(args.cedfs_config)
     # handle prefill instances
     if args.prefill_servers_urls.lower() in ("disable", "none", ""):
         app.state.p_urls = []
