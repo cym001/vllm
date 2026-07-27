@@ -116,19 +116,36 @@ def sanitize_for_pd(request_data: dict, cache_refs: list[dict]) -> dict:
     return sanitized
 
 
-def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
+async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
     client = getattr(app.state, "cedfs_client", None)
     scopes = getattr(app.state, "candidate_scopes", [])
     if not identifiers:
         return []
     if client is None or not scopes:
         raise RuntimeError("CedFS cache_ref resolver is not configured")
-    values = client.batch_find_first_ready(scopes, identifiers, [])
+    timeout_ms = app.state.cache_ready_timeout_ms
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    pending = list(identifiers)
+    resolved = {}
+    while pending:
+        values = await asyncio.to_thread(
+            client.batch_find_first_ready, scopes, pending, []
+        )
+        for identifier in list(pending):
+            if value := values.get(identifier):
+                resolved[identifier] = value
+                pending.remove(identifier)
+        if not pending:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                f"no READY CedFS candidate within {timeout_ms}ms for {pending}"
+            )
+        await asyncio.sleep(0.02)
+
     refs = []
     for identifier in identifiers:
-        value = values.get(identifier)
-        if not value:
-            raise RuntimeError(f"no READY CedFS candidate for {identifier}")
+        value = resolved[identifier]
         meta = value["meta"]
         refs.append(
             {
@@ -394,12 +411,23 @@ async def log_requests(request: Request, call_next):
 async def on_startup() -> None:
     global encode_session, prefill_session, decode_session
     timeout = aiohttp.ClientTimeout(total=100_000)
-    connector = aiohttp.TCPConnector(limit=0, force_close=False)
-    encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    encode_session = aiohttp.ClientSession(
+        timeout=timeout,
+        connector=aiohttp.TCPConnector(limit=0, force_close=False),
+    )
     if app.state.p_urls:
         # only setup if prefill instance(s) exist
-        prefill_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    decode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        prefill_session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(limit=0, force_close=False),
+        )
+    # A stale keep-alive connection can be closed by the vLLM server between
+    # selection and POST. Do not retry a potentially non-idempotent generation;
+    # use a fresh decode connection instead.
+    decode_session = aiohttp.ClientSession(
+        timeout=timeout,
+        connector=aiohttp.TCPConnector(limit=0, force_close=True),
+    )
     max_encoder_inflight = app.state.max_encoder_inflight
     app.state.encoder_semaphore = (
         asyncio.Semaphore(max_encoder_inflight) if max_encoder_inflight > 0 else None
@@ -430,7 +458,7 @@ async def forward_non_stream(
         assign_mm_identifiers(req_data)
         identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
         if identifiers:
-            req_data = sanitize_for_pd(req_data, resolve_cache_refs(identifiers))
+            req_data = sanitize_for_pd(req_data, await resolve_cache_refs(identifiers))
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -461,7 +489,7 @@ async def forward_stream(
         assign_mm_identifiers(req_data)
         identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
         if identifiers:
-            req_data = sanitize_for_pd(req_data, resolve_cache_refs(identifiers))
+            req_data = sanitize_for_pd(req_data, await resolve_cache_refs(identifiers))
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -699,6 +727,12 @@ if __name__ == "__main__":
         default="",
         help="Ordered comma-separated compatible producer scopes",
     )
+    parser.add_argument(
+        "--cache-ready-timeout-ms",
+        type=int,
+        default=60000,
+        help="Bounded wait for COMPLETE CedFS objects before terminal failure",
+    )
 
     args = parser.parse_args()
     app.state.e_urls = [
@@ -711,6 +745,7 @@ if __name__ == "__main__":
     app.state.candidate_scopes = [
         scope.strip() for scope in args.candidate_scopes.split(",") if scope.strip()
     ]
+    app.state.cache_ready_timeout_ms = max(1, args.cache_ready_timeout_ms)
     app.state.cedfs_client = None
     if args.cedfs_config:
         from cedfs_ec._native import CedfsECClient

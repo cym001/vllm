@@ -3078,6 +3078,32 @@ def test_strict_ec_pending_does_not_block_later_ready_request():
     ]
 
 
+def test_strict_ec_failed_never_falls_back_to_local_encoder():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["failed_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.FAILED
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert output.scheduled_encoder_inputs == {}
+    assert request.status == RequestStatus.WAITING
+
+
 def test_strict_ec_async_load_uses_transfer_only_step_before_prefill():
     scheduler = create_scheduler(
         model="llava-hf/llava-1.5-7b-hf",

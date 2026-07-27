@@ -1305,12 +1305,14 @@ class Scheduler(SchedulerInterface):
                     external_load_encoder_input.append(i)
                     num_embeds_to_schedule += num_encoder_embeds
                     continue
-                # PENDING means the externally produced object may still become
-                # usable. FAILED is terminal for this lookup round and must
-                # converge to local recompute instead of blocking forever.
+                # A strict consumer must never execute the encoder locally.
+                # PENDING may become READY; FAILED is kept blocked here so the
+                # bounded E-PD proxy can return the request-level terminal
+                # error without a silent cloud-side fallback.
                 if (
                     self.ec_connector.requires_external_cache()
-                    and availability == ECCacheAvailability.PENDING
+                    and availability
+                    in (ECCacheAvailability.PENDING, ECCacheAvailability.FAILED)
                 ):
                     if num_computed_tokens + shift_computed_tokens < start_pos:
                         num_new_tokens = start_pos - (
