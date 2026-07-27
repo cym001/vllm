@@ -147,6 +147,11 @@ async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
     for identifier in identifiers:
         value = resolved[identifier]
         meta = value["meta"]
+        logger.info(
+            "Resolved CedFS cache_ref: mm_hash=%s model_scope=%s",
+            identifier,
+            value["model_scope"],
+        )
         refs.append(
             {
                 "version": 1,
@@ -226,6 +231,12 @@ async def fanout_encoder_primer(
     url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
 
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
+        logger.info(
+            "[%s] Routing encoder item #%d to %s",
+            req_id,
+            idx,
+            target_url,
+        )
         # Derive a *child* request id:  <parent>:<index>:<random-short>
         child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"
         headers = {"x-request-id": child_req_id}
@@ -532,9 +543,26 @@ async def chat_completions(request: Request):
         req_data = await request.json()
         req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
-        e_urls = app.state.e_urls  # we want the full list for fan-out
+        # Rotate the list once per request so a single-image workload uses all
+        # Encoder instances instead of always selecting the first one.
+        encoder_rr_index = getattr(app.state, "encoder_rr_index", 0)
+        encoder_index = encoder_rr_index % len(app.state.e_urls)
+        app.state.encoder_rr_index = encoder_rr_index + 1
+        e_urls = (
+            app.state.e_urls[encoder_index:]
+            + app.state.e_urls[:encoder_index]
+        )
         p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
-        d_url = random.choice(app.state.d_urls)
+        decode_rr_index = getattr(app.state, "decode_rr_index", 0)
+        decode_index = decode_rr_index % len(app.state.d_urls)
+        app.state.decode_rr_index = decode_rr_index + 1
+        d_url = app.state.d_urls[decode_index]
+        logger.info(
+            "[%s] Routing request to encoder_start=%s decode=%s",
+            req_id,
+            e_urls[0],
+            d_url,
+        )
 
         is_streaming = req_data.get("stream", False)
 
@@ -742,6 +770,8 @@ if __name__ == "__main__":
         u.strip() for u in args.decode_servers_urls.split(",") if u.strip()
     ]
     app.state.max_encoder_inflight = max(0, args.max_encoder_inflight)
+    app.state.encoder_rr_index = 0
+    app.state.decode_rr_index = 0
     app.state.candidate_scopes = [
         scope.strip() for scope in args.candidate_scopes.split(",") if scope.strip()
     ]
