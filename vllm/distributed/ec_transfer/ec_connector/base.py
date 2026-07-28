@@ -188,6 +188,10 @@ class ECConnectorBase(ABC):
         """
         return None, None
 
+    def get_failed(self) -> dict[str, str] | None:
+        """Return and drain asynchronous encoder-cache load failures."""
+        return None
+
     # ==============================
     # Scheduler-side methods
     # ==============================

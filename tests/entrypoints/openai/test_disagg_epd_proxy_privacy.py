@@ -4,6 +4,7 @@ import json
 import asyncio
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 
@@ -70,7 +71,11 @@ def test_cache_ref_resolution_waits_until_ready():
             return {
                 identifiers[0]: {
                     "model_scope": scopes[0],
-                    "meta": {"sha256": "ab" * 32, "num_encoder_token": 64},
+                    "meta": {
+                        "sha256": "ab" * 32,
+                        "num_encoder_token": 64,
+                        "payload_size": 257_359_872,
+                    },
                     "location": {"ino": 9},
                 }
             }
@@ -85,3 +90,139 @@ def test_cache_ref_resolution_waits_until_ready():
     assert client.calls == 2
     assert refs[0]["model_scope"] == "rg_fp_edge"
     assert refs[0]["ino"] == 9
+    assert refs[0]["payload_size"] == 257_359_872
+
+
+def test_formula_delay_admission_rejects_request_that_cannot_meet_deadline():
+    proxy.app.state.request_timeout_ms = 60_000
+    proxy.app.state.simulated_bandwidth_mbps = 200
+    proxy.app.state.simulated_rtt_ms = 40
+    proxy.app.state.simulated_hold_ms = 30_000
+    proxy.app.state.deadline_reserve_ms = 10_000
+    cache_refs = [{"payload_size": 257_359_872}]
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        with pytest.raises(proxy.HTTPException) as exc_info:
+            proxy.ensure_ec_deadline_admission(
+                cache_refs, "large-request", loop.time() + 45
+            )
+        assert exc_info.value.status_code == 504
+        assert exc_info.value.detail["type"] == "deadline_admission_reject"
+        assert exc_info.value.detail["minimum_ec_delay_ms"] == pytest.approx(
+            40_334.395, abs=0.001
+        )
+
+    asyncio.run(check())
+
+
+def test_formula_delay_admission_accepts_request_with_sufficient_budget():
+    proxy.app.state.request_timeout_ms = 60_000
+    proxy.app.state.simulated_bandwidth_mbps = 200
+    proxy.app.state.simulated_rtt_ms = 40
+    proxy.app.state.simulated_hold_ms = 30_000
+    proxy.app.state.deadline_reserve_ms = 10_000
+    cache_refs = [{"payload_size": 257_359_872}]
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        proxy.ensure_ec_deadline_admission(
+            cache_refs, "large-request", loop.time() + 51
+        )
+
+    asyncio.run(check())
+
+
+def test_non_stream_deadline_cancels_inflight_decode_request():
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self.cancelled = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    response = Response()
+
+    class Session:
+        def post(self, *_args, **_kwargs):
+            return response
+
+    proxy.decode_session = Session()
+    proxy.app.state.request_timeout_ms = 10
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(proxy.HTTPException) as exc_info:
+            await proxy.forward_non_stream(
+                {},
+                "deadline-request",
+                ["http://encoder"],
+                None,
+                "http://decode",
+                started,
+                started + 0.01,
+            )
+        assert exc_info.value.status_code == 504
+        assert exc_info.value.detail["type"] == "request_deadline_exceeded"
+
+    asyncio.run(check())
+    assert response.cancelled is True
+
+
+def test_non_stream_preserves_pd_terminal_error_body():
+    class Response:
+        status = 500
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self):
+            return '{"error":{"type":"engine_error"}}'
+
+    class Session:
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    proxy.decode_session = Session()
+    proxy.app.state.request_timeout_ms = 60_000
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(proxy.HTTPException) as exc_info:
+            await proxy.forward_non_stream(
+                {},
+                "pd-error-request",
+                ["http://encoder"],
+                None,
+                "http://decode",
+                started,
+                started + 60,
+            )
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == {
+            "type": "pd_request_failed",
+            "request_id": "pd-error-request",
+            "message": '{"error":{"type":"engine_error"}}',
+        }
+
+    asyncio.run(check())

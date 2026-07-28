@@ -40,6 +40,7 @@ class ECConnectorModelRunnerMixin:
         if ec_connector_output is None or (
             not ec_connector_output.finished_sending
             and not ec_connector_output.finished_recving
+            and not ec_connector_output.failed_recving
         ):
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
@@ -97,5 +98,6 @@ class ECConnectorModelRunnerMixin:
             output.finished_sending, output.finished_recving = (
                 ec_connector.get_finished(scheduler_output.finished_req_ids)
             )
+            output.failed_recving = ec_connector.get_failed()
 
             ec_connector.clear_connector_metadata()

@@ -33,7 +33,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    ECConnectorOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -3141,6 +3146,52 @@ def test_strict_ec_async_load_uses_transfer_only_step_before_prefill():
     assert prefill_output.num_scheduled_tokens[request.request_id] == 200
     assert request.status == RequestStatus.RUNNING
     assert request.request_id not in scheduler.pending_ec_loads
+
+
+def test_strict_ec_async_load_failure_finishes_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["failed_async_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.READY
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.ec_connector.supports_async_load = Mock(return_value=True)
+    scheduler.ec_connector.is_async_load_finished = Mock(return_value=False)
+    scheduler.add_request(request)
+
+    transfer_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_ECS
+
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        ec_connector_output=ECConnectorOutput(
+            failed_recving={
+                "failed_async_hash": "ValueError: checksum mismatch"
+            }
+        ),
+    )
+    outputs = scheduler.update_from_output(transfer_output, model_output)
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.pending_ec_loads
+    assert request.request_id not in scheduler.requests
+    assert outputs[0].outputs[0].finish_reason == FinishReason.ERROR
+    assert "checksum mismatch" in outputs[0].outputs[0].stop_reason
 
 
 @pytest.mark.parametrize("use_kv_connector", [False, True])

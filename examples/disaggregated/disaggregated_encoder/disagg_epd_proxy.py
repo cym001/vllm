@@ -25,6 +25,7 @@ import base64
 import copy
 import hashlib
 import io
+import json
 import logging
 import os
 import random
@@ -77,6 +78,62 @@ def assign_mm_identifiers(request_data: dict) -> list[str]:
         item["uuid"] = identifier
         identifiers.append(identifier)
     return identifiers
+
+
+def _log_timeline(req_id: str, event: str, started: float, deadline: float) -> None:
+    now = asyncio.get_running_loop().time()
+    logger.info(
+        "E-PD request timeline: request_id=%s event=%s elapsed_ms=%d "
+        "remaining_ms=%d",
+        req_id,
+        event,
+        int((now - started) * 1000),
+        max(0, int((deadline - now) * 1000)),
+    )
+
+
+def _minimum_ec_delay_ms(cache_refs: list[dict]) -> float:
+    bandwidth_mbps = float(
+        getattr(app.state, "simulated_bandwidth_mbps", 0)
+    )
+    if bandwidth_mbps <= 0:
+        return 0.0
+    rtt_ms = float(getattr(app.state, "simulated_rtt_ms", 0))
+    hold_ms = float(getattr(app.state, "simulated_hold_ms", 0))
+    payload_delays = [
+        float(ref["payload_size"]) * 8 * 1000
+        / (bandwidth_mbps * 1_000_000)
+        for ref in cache_refs
+        if ref.get("payload_size") is not None
+    ]
+    if not payload_delays:
+        return 0.0
+    # Consumer prefetches different MM objects concurrently. The largest object
+    # is the lower bound for request-level simulated transfer time.
+    return max(payload_delays) + rtt_ms + hold_ms
+
+
+def ensure_ec_deadline_admission(
+    cache_refs: list[dict], req_id: str, deadline: float
+) -> None:
+    minimum_ec_delay_ms = _minimum_ec_delay_ms(cache_refs)
+    if minimum_ec_delay_ms <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    remaining_ms = max(0.0, (deadline - loop.time()) * 1000)
+    reserve_ms = float(getattr(app.state, "deadline_reserve_ms", 0))
+    if remaining_ms >= minimum_ec_delay_ms + reserve_ms:
+        return
+    detail = {
+        "type": "deadline_admission_reject",
+        "request_id": req_id,
+        "budget_ms": int(getattr(app.state, "request_timeout_ms", 60000)),
+        "remaining_ms": round(remaining_ms, 3),
+        "minimum_ec_delay_ms": round(minimum_ec_delay_ms, 3),
+        "reserve_ms": round(reserve_ms, 3),
+    }
+    logger.warning("E-PD deadline admission rejected: %s", detail)
+    raise HTTPException(status_code=504, detail=detail)
 
 
 def _blank_image_url(original: str) -> str:
@@ -159,6 +216,7 @@ async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
                 "model_scope": value["model_scope"],
                 "sha256": meta["sha256"],
                 "num_encoder_token": meta.get("num_encoder_token"),
+                "payload_size": meta.get("payload_size"),
                 "ino": (value.get("location") or {}).get("ino"),
             }
         )
@@ -462,74 +520,155 @@ async def on_shutdown() -> None:
 
 
 async def forward_non_stream(
-    req_data: dict, req_id: str, e_urls: list[str], p_url: str, d_url: str
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    p_url: str,
+    d_url: str,
+    request_started: float,
+    deadline: float,
 ) -> dict:
     try:
-        # Step 1: Process through Encoder instance (if has MM input)
-        assign_mm_identifiers(req_data)
-        identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
-        if identifiers:
-            req_data = sanitize_for_pd(req_data, await resolve_cache_refs(identifiers))
+        async with asyncio.timeout_at(deadline):
+            # Step 1: Process through Encoder instance (if has MM input)
+            assign_mm_identifiers(req_data)
+            identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
+            _log_timeline(req_id, "encoder_done", request_started, deadline)
+            if identifiers:
+                cache_refs = await resolve_cache_refs(identifiers)
+                _log_timeline(req_id, "cache_ref_ready", request_started, deadline)
+                ensure_ec_deadline_admission(cache_refs, req_id, deadline)
+                req_data = sanitize_for_pd(req_data, cache_refs)
 
-        # Step 2: Process through Prefill instance
-        req_data = await maybe_prefill(req_data, p_url, req_id)
+            # Step 2: Process through Prefill instance
+            req_data = await maybe_prefill(req_data, p_url, req_id)
 
-        # Step 3: Process through Decode instance
-        logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
-        headers = {"x-request-id": req_id}
+            # Step 3: Process through Decode instance
+            logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
+            _log_timeline(req_id, "pd_submit", request_started, deadline)
+            headers = {"x-request-id": req_id}
 
-        # Non-streaming response
-        async with decode_session.post(
-            f"{d_url}/v1/chat/completions", json=req_data, headers=headers
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+            # Cancelling this context closes the in-flight aiohttp request. The
+            # vLLM API server observes the disconnect and aborts request_id.
+            async with decode_session.post(
+                f"{d_url}/v1/chat/completions", json=req_data, headers=headers
+            ) as resp:
+                if resp.status >= 400:
+                    error_body = await resp.text()
+                    raise HTTPException(
+                        status_code=resp.status,
+                        detail={
+                            "type": "pd_request_failed",
+                            "request_id": req_id,
+                            "message": error_body,
+                        },
+                    )
+                result = await resp.json()
+            _log_timeline(req_id, "response_done", request_started, deadline)
+            return result
 
     except HTTPException:
+        _log_timeline(req_id, "terminal_error", request_started, deadline)
         raise
+    except TimeoutError as exc:
+        _log_timeline(req_id, "deadline_exceeded", request_started, deadline)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "type": "request_deadline_exceeded",
+                "request_id": req_id,
+                "budget_ms": int(app.state.request_timeout_ms),
+            },
+        ) from exc
     except Exception as e:
+        _log_timeline(req_id, "terminal_error", request_started, deadline)
         logger.exception("[%s] Error in forward_non_stream: %s", req_id, str(e))
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}") from e
 
 
 async def forward_stream(
-    req_data: dict, req_id: str, e_urls: list[str], p_url: str, d_url: str
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    p_url: str,
+    d_url: str,
+    request_started: float,
+    deadline: float,
 ) -> AsyncIterator[str]:
     try:
-        # Step 1: Process through Encoder instance (if has MM input)
-        assign_mm_identifiers(req_data)
-        identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
-        if identifiers:
-            req_data = sanitize_for_pd(req_data, await resolve_cache_refs(identifiers))
+        async with asyncio.timeout_at(deadline):
+            # Step 1: Process through Encoder instance (if has MM input)
+            assign_mm_identifiers(req_data)
+            identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
+            _log_timeline(req_id, "encoder_done", request_started, deadline)
+            if identifiers:
+                cache_refs = await resolve_cache_refs(identifiers)
+                _log_timeline(req_id, "cache_ref_ready", request_started, deadline)
+                ensure_ec_deadline_admission(cache_refs, req_id, deadline)
+                req_data = sanitize_for_pd(req_data, cache_refs)
 
-        # Step 2: Process through Prefill instance
-        req_data = await maybe_prefill(req_data, p_url, req_id)
+            # Step 2: Process through Prefill instance
+            req_data = await maybe_prefill(req_data, p_url, req_id)
 
-        # Step 3: Process through Decode instance
-        logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
-        headers = {"x-request-id": req_id}
+            # Step 3: Process through Decode instance
+            logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
+            _log_timeline(req_id, "pd_submit", request_started, deadline)
+            headers = {"x-request-id": req_id}
 
-        # Streaming response
-        async with decode_session.post(
-            f"{d_url}/v1/chat/completions",
-            json=req_data,
-            headers=headers,
-        ) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.content.iter_chunked(1024):
-                if chunk:
-                    yield chunk.decode("utf-8", errors="ignore")
+            async with decode_session.post(
+                f"{d_url}/v1/chat/completions",
+                json=req_data,
+                headers=headers,
+            ) as resp:
+                if resp.status >= 400:
+                    error_body = await resp.text()
+                    raise HTTPException(
+                        status_code=resp.status,
+                        detail={
+                            "type": "pd_request_failed",
+                            "request_id": req_id,
+                            "message": error_body,
+                        },
+                    )
+                async for chunk in resp.content.iter_chunked(1024):
+                    if chunk:
+                        yield chunk.decode("utf-8", errors="ignore")
 
-        logger.info("[%s] Streaming completed", req_id)
+            logger.info("[%s] Streaming completed", req_id)
+            _log_timeline(req_id, "response_done", request_started, deadline)
 
-    except HTTPException:
-        logger.exception("[%s] HTTPException in forward_stream", req_id)
-        raise
+    except HTTPException as exc:
+        _log_timeline(req_id, "terminal_error", request_started, deadline)
+        detail = (
+            exc.detail
+            if isinstance(exc.detail, dict)
+            else {"type": "proxy_http_error", "message": str(exc.detail)}
+        )
+        yield (
+            f"data: {json.dumps({'error': detail})}\n\n"
+            "data: [DONE]\n\n"
+        )
+    except TimeoutError:
+        _log_timeline(req_id, "deadline_exceeded", request_started, deadline)
+        error = {
+            "error": {
+                "type": "request_deadline_exceeded",
+                "request_id": req_id,
+                "budget_ms": int(app.state.request_timeout_ms),
+            }
+        }
+        yield f"data: {json.dumps(error)}\n\ndata: [DONE]\n\n"
     except Exception as e:
+        _log_timeline(req_id, "terminal_error", request_started, deadline)
         logger.exception("[%s] Error in forward_stream: %s", req_id, str(e))
-        raise HTTPException(
-            status_code=500, detail=f"Proxy streaming error: {str(e)}"
-        ) from e
+        error = {
+            "error": {
+                "type": "proxy_streaming_error",
+                "request_id": req_id,
+                "message": str(e),
+            }
+        }
+        yield f"data: {json.dumps(error)}\n\ndata: [DONE]\n\n"
 
 
 ###############################################################################
@@ -540,8 +679,11 @@ async def forward_stream(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
+        request_started = asyncio.get_running_loop().time()
+        deadline = request_started + app.state.request_timeout_ms / 1000
         req_data = await request.json()
         req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        _log_timeline(req_id, "request_ingress", request_started, deadline)
 
         # Rotate the list once per request so a single-image workload uses all
         # Encoder instances instead of always selecting the first one.
@@ -568,10 +710,26 @@ async def chat_completions(request: Request):
 
         if is_streaming:
             return StreamingResponse(
-                forward_stream(req_data, req_id, e_urls, p_url, d_url),
+                forward_stream(
+                    req_data,
+                    req_id,
+                    e_urls,
+                    p_url,
+                    d_url,
+                    request_started,
+                    deadline,
+                ),
                 media_type="text/event-stream",
             )
-        result = await forward_non_stream(req_data, req_id, e_urls, p_url, d_url)
+        result = await forward_non_stream(
+            req_data,
+            req_id,
+            e_urls,
+            p_url,
+            d_url,
+            request_started,
+            deadline,
+        )
         return JSONResponse(content=result)
 
     except HTTPException:
@@ -761,6 +919,21 @@ if __name__ == "__main__":
         default=60000,
         help="Bounded wait for COMPLETE CedFS objects before terminal failure",
     )
+    parser.add_argument(
+        "--request-timeout-ms",
+        type=int,
+        default=60000,
+        help="End-to-end Proxy request deadline",
+    )
+    parser.add_argument("--simulated-bandwidth-mbps", type=float, default=0)
+    parser.add_argument("--simulated-rtt-ms", type=float, default=0)
+    parser.add_argument("--simulated-hold-ms", type=float, default=0)
+    parser.add_argument(
+        "--deadline-reserve-ms",
+        type=int,
+        default=10000,
+        help="Budget reserved for PD processing and cancellation cleanup",
+    )
 
     args = parser.parse_args()
     app.state.e_urls = [
@@ -776,6 +949,13 @@ if __name__ == "__main__":
         scope.strip() for scope in args.candidate_scopes.split(",") if scope.strip()
     ]
     app.state.cache_ready_timeout_ms = max(1, args.cache_ready_timeout_ms)
+    app.state.request_timeout_ms = max(1, args.request_timeout_ms)
+    app.state.simulated_bandwidth_mbps = max(
+        0.0, args.simulated_bandwidth_mbps
+    )
+    app.state.simulated_rtt_ms = max(0.0, args.simulated_rtt_ms)
+    app.state.simulated_hold_ms = max(0.0, args.simulated_hold_ms)
+    app.state.deadline_reserve_ms = max(0, args.deadline_reserve_ms)
     app.state.cedfs_client = None
     if args.cedfs_config:
         from cedfs_ec._native import CedfsECClient

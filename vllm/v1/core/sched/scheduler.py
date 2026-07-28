@@ -1401,6 +1401,40 @@ class Scheduler(SchedulerInterface):
             )
         if ec_connector_output and self.ec_connector is not None:
             self.ec_connector.update_connector_output(ec_connector_output)
+        failed_ec_requests: list[Request] = []
+        if ec_connector_output and ec_connector_output.failed_recving:
+            failed_hashes = set(ec_connector_output.failed_recving)
+            failed_ec_requests = [
+                request
+                for req_id, required_hashes in self.pending_ec_loads.items()
+                if required_hashes & failed_hashes
+                and (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+            ]
+            for request in failed_ec_requests:
+                request_failures = {
+                    mm_hash: ec_connector_output.failed_recving[mm_hash]
+                    for mm_hash in self.pending_ec_loads.get(
+                        request.request_id, ()
+                    )
+                    if mm_hash in ec_connector_output.failed_recving
+                }
+                request.stop_reason = (
+                    "cedfs_ec_load_failed: "
+                    + "; ".join(
+                        f"{mm_hash}={reason}"
+                        for mm_hash, reason in sorted(request_failures.items())
+                    )
+                )
+                logger.error(
+                    "Failing request %s due to EC load failure: %s",
+                    request.request_id,
+                    request_failures,
+                )
+            self.finish_requests(
+                (request.request_id for request in failed_ec_requests),
+                RequestStatus.FINISHED_ERROR,
+            )
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -1629,6 +1663,17 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+        for request in failed_ec_requests:
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
