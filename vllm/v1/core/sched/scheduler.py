@@ -10,6 +10,7 @@ from typing import Any
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECCacheAvailability,
     ECConnectorBase,
     ECConnectorMetadata,
     ECConnectorRole,
@@ -201,6 +202,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.pending_ec_loads: dict[str, set[str]] = {}
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -520,6 +522,8 @@ class Scheduler(SchedulerInterface):
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
+            async_load_encoder_input: list[int] = []
+            external_cache_blocked = False
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
                 (
@@ -527,6 +531,8 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     new_encoder_compute_budget,
                     external_load_encoder_input,
+                    external_cache_blocked,
+                    async_load_encoder_input,
                 ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
@@ -539,6 +545,18 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            if async_load_encoder_input and num_new_tokens == 0:
+                required_hashes = set()
+                for i in async_load_encoder_input:
+                    assert self.ec_connector is not None
+                    self.ec_connector.update_state_for_async_load(request, i)
+                    required_hashes.add(request.mm_features[i].identifier)
+                self.pending_ec_loads[request.request_id] = required_hashes
+                self.running.pop(req_index)
+                request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
+                self.skipped_waiting.add_request(request)
+                continue
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -822,6 +840,8 @@ class Scheduler(SchedulerInterface):
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
+                async_load_encoder_input = []
+                external_cache_blocked = False
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
 
@@ -882,6 +902,8 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
+                            external_cache_blocked,
+                            async_load_encoder_input,
                         ) = self._try_schedule_encoder_inputs(
                             request,
                             num_computed_tokens,
@@ -891,6 +913,27 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if async_load_encoder_input:
+                                request = request_queue.pop_request()
+                                required_hashes = set()
+                                for i in async_load_encoder_input:
+                                    assert self.ec_connector is not None
+                                    self.ec_connector.update_state_for_async_load(
+                                        request, i
+                                    )
+                                    required_hashes.add(
+                                        request.mm_features[i].identifier
+                                    )
+                                self.pending_ec_loads[request.request_id] = (
+                                    required_hashes
+                                )
+                                request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
+                                step_skipped_waiting.prepend_request(request)
+                                continue
+                            if external_cache_blocked:
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -1392,7 +1435,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], bool, list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -1414,12 +1457,14 @@ class Scheduler(SchedulerInterface):
         blocks and externally cached blocks (via KVConnector).
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
-            return [], num_new_tokens, encoder_compute_budget, []
+            return [], num_new_tokens, encoder_compute_budget, [], False, []
         encoder_inputs_to_schedule: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
         assert len(mm_features) > 0
         external_load_encoder_input = []
+        async_load_encoder_input = []
+        external_cache_blocked = False
 
         # NOTE: since scheduler operates on the request level (possibly with
         # multiple encoder inputs per request), we need to create temporary
@@ -1525,13 +1570,47 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
-            ):
-                mm_hashes_to_schedule.add(item_identifier)
-                external_load_encoder_input.append(i)
-                num_embeds_to_schedule += num_encoder_embeds
-                continue
+            if self.ec_connector is not None:
+                availability = self.ec_connector.get_cache_availability(
+                    item_identifier
+                )
+                if availability == ECCacheAvailability.READY:
+                    if (
+                        self.ec_connector.supports_async_load()
+                        and not self.ec_connector.is_async_load_finished(
+                            item_identifier
+                        )
+                    ):
+                        if num_computed_tokens + shift_computed_tokens < start_pos:
+                            num_new_tokens = start_pos - (
+                                num_computed_tokens + shift_computed_tokens
+                            )
+                        else:
+                            num_new_tokens = 0
+                        external_cache_blocked = True
+                        async_load_encoder_input.append(i)
+                        break
+                    mm_hashes_to_schedule.add(item_identifier)
+                    external_load_encoder_input.append(i)
+                    num_embeds_to_schedule += num_encoder_embeds
+                    continue
+                # A strict consumer must never execute the encoder locally.
+                # PENDING may become READY; FAILED is kept blocked here so the
+                # bounded E-PD proxy can return the request-level terminal
+                # error without a silent cloud-side fallback.
+                if (
+                    self.ec_connector.requires_external_cache()
+                    and availability
+                    in (ECCacheAvailability.PENDING, ECCacheAvailability.FAILED)
+                ):
+                    if num_computed_tokens + shift_computed_tokens < start_pos:
+                        num_new_tokens = start_pos - (
+                            num_computed_tokens + shift_computed_tokens
+                        )
+                    else:
+                        num_new_tokens = 0
+                    external_cache_blocked = True
+                    break
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds
@@ -1543,6 +1622,8 @@ class Scheduler(SchedulerInterface):
             num_new_tokens,
             encoder_compute_budget,
             external_load_encoder_input,
+            external_cache_blocked,
+            async_load_encoder_input,
         )
 
     def _make_scheduled_encoder_input_stats(
@@ -1598,6 +1679,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
@@ -1621,6 +1703,42 @@ class Scheduler(SchedulerInterface):
             failed_kv_load_req_ids = self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
+            )
+        if ec_connector_output and self.ec_connector is not None:
+            self.ec_connector.update_connector_output(ec_connector_output)
+        failed_ec_requests: list[Request] = []
+        if ec_connector_output and ec_connector_output.failed_recving:
+            failed_hashes = set(ec_connector_output.failed_recving)
+            failed_ec_requests = [
+                request
+                for req_id, required_hashes in self.pending_ec_loads.items()
+                if required_hashes & failed_hashes
+                and (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+            ]
+            for request in failed_ec_requests:
+                request_failures = {
+                    mm_hash: ec_connector_output.failed_recving[mm_hash]
+                    for mm_hash in self.pending_ec_loads.get(
+                        request.request_id, ()
+                    )
+                    if mm_hash in ec_connector_output.failed_recving
+                }
+                request.stop_reason = (
+                    "cedfs_ec_load_failed: "
+                    + "; ".join(
+                        f"{mm_hash}={reason}"
+                        for mm_hash, reason in sorted(request_failures.items())
+                    )
+                )
+                logger.error(
+                    "Failing request %s due to EC load failure: %s",
+                    request.request_id,
+                    request_failures,
+                )
+            self.finish_requests(
+                (request.request_id for request in failed_ec_requests),
+                RequestStatus.FINISHED_ERROR,
             )
 
         # Persist per-step routed experts into the scheduler-side slot
@@ -1882,6 +2000,17 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+        for request in failed_ec_requests:
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -1964,6 +2093,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_REMOTE_ECS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -2191,6 +2321,7 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            self.pending_ec_loads.pop(request.request_id, None)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2594,6 +2725,21 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            if request.num_preemptions:
+                request.status = RequestStatus.PREEMPTED
+            else:
+                request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_ECS:
+            assert self.ec_connector is not None
+            required_hashes = self.pending_ec_loads.get(request.request_id, set())
+            if not all(
+                self.ec_connector.is_async_load_finished(mm_hash)
+                for mm_hash in required_hashes
+            ):
+                return False
+            self.pending_ec_loads.pop(request.request_id, None)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
