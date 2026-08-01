@@ -2997,6 +2997,12 @@ class GPUModelRunner(
             if not mm_kwargs:
                 return []  # nothing left to encode after filtering out `prompt_embeds`
 
+        logger.info(
+            "vLLM MM encoder execution: item_count=%d request_count=%d",
+            len(mm_kwargs),
+            len({req_id for req_id, _ in mm_lora_refs}),
+        )
+
         should_time = bool(
             self.observability_config
             and self.observability_config.enable_mm_processor_stats
