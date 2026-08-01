@@ -226,6 +226,8 @@ class ECConnectorOutput:
     # [mm_hash]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    # mm_hash -> worker-side load failure reason
+    failed_recving: dict[str, str] | None = None
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
