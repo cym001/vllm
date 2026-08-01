@@ -93,6 +93,216 @@ def test_cache_ref_resolution_waits_until_ready():
     assert refs[0]["payload_size"] == 257_359_872
 
 
+def _cache_ref(mm_hash: str) -> dict:
+    return {
+        "version": 1,
+        "mm_hash": mm_hash,
+        "model_scope": "rg_fp_edge",
+        "sha256": "ab" * 32,
+        "num_encoder_token": 64,
+        "payload_size": 1024,
+        "ino": 9,
+    }
+
+
+def test_ready_only_hit_skips_encoder(monkeypatch):
+    request = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _image_data_url()}},
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ],
+    }
+    identifier = proxy.assign_mm_identifiers(request)[0]
+    encoder_called = False
+
+    async def find_ready(identifiers):
+        return {identifier: _cache_ref(identifier)}
+
+    async def dispatch(*_args, **_kwargs):
+        nonlocal encoder_called
+        encoder_called = True
+        return []
+
+    monkeypatch.setattr(proxy, "find_ready_cache_refs", find_ready)
+    monkeypatch.setattr(proxy, "fanout_encoder_primer", dispatch)
+    monkeypatch.setattr(
+        proxy.app.state, "encoder_dispatch_policy", "ready-only", raising=False
+    )
+    proxy.app.state.simulated_bandwidth_mbps = 0
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        return await proxy.prepare_multimodal_request(
+            request, ["http://encoder"], "ready-hit", started, started + 60
+        )
+
+    prepared = asyncio.run(check())
+
+    assert encoder_called is False
+    assert prepared["cedfs_cache_refs"] == [_cache_ref(identifier)]
+
+
+def test_ready_only_miss_fails_without_encoder(monkeypatch):
+    request = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _image_data_url()}},
+                ],
+            }
+        ],
+    }
+    encoder_called = False
+
+    async def find_ready(_identifiers):
+        return {}
+
+    async def dispatch(*_args, **_kwargs):
+        nonlocal encoder_called
+        encoder_called = True
+        return []
+
+    monkeypatch.setattr(proxy, "find_ready_cache_refs", find_ready)
+    monkeypatch.setattr(proxy, "fanout_encoder_primer", dispatch)
+    monkeypatch.setattr(
+        proxy.app.state, "encoder_dispatch_policy", "ready-only", raising=False
+    )
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(proxy.HTTPException) as exc_info:
+            await proxy.prepare_multimodal_request(
+                request, ["http://encoder"], "ready-miss", started, started + 60
+            )
+        assert exc_info.value.status_code == 424
+        assert exc_info.value.detail["type"] == "cedfs_ready_cache_miss"
+
+    asyncio.run(check())
+    assert encoder_called is False
+
+
+def test_lookup_first_dispatches_only_missing_items(monkeypatch):
+    request = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url()},
+                        "uuid": "ready-image",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url()},
+                        "uuid": "missing-image",
+                    },
+                ],
+            }
+        ],
+    }
+    dispatched = None
+
+    async def find_ready(_identifiers):
+        return {"ready-image": _cache_ref("ready-image")}
+
+    async def dispatch(_request, _urls, _req_id, identifiers_to_encode):
+        nonlocal dispatched
+        dispatched = identifiers_to_encode
+        return list(identifiers_to_encode)
+
+    async def resolve(identifiers):
+        return [_cache_ref(identifier) for identifier in identifiers]
+
+    monkeypatch.setattr(proxy, "find_ready_cache_refs", find_ready)
+    monkeypatch.setattr(proxy, "fanout_encoder_primer", dispatch)
+    monkeypatch.setattr(proxy, "resolve_cache_refs", resolve)
+    monkeypatch.setattr(
+        proxy.app.state, "encoder_dispatch_policy", "lookup-first", raising=False
+    )
+    proxy.app.state.simulated_bandwidth_mbps = 0
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        return await proxy.prepare_multimodal_request(
+            request, ["http://encoder"], "partial-hit", started, started + 60
+        )
+
+    prepared = asyncio.run(check())
+
+    assert dispatched == {"missing-image"}
+    assert [ref["mm_hash"] for ref in prepared["cedfs_cache_refs"]] == [
+        "ready-image",
+        "missing-image",
+    ]
+
+
+def test_always_policy_preserves_encoder_first_path(monkeypatch):
+    request = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url()},
+                        "uuid": "image-a",
+                    },
+                ],
+            }
+        ],
+    }
+    lookup_called = False
+    dispatched = None
+
+    async def find_ready(_identifiers):
+        nonlocal lookup_called
+        lookup_called = True
+        return {}
+
+    async def dispatch(_request, _urls, _req_id, identifiers_to_encode):
+        nonlocal dispatched
+        dispatched = identifiers_to_encode
+        return ["image-a"]
+
+    async def resolve(identifiers):
+        return [_cache_ref(identifier) for identifier in identifiers]
+
+    monkeypatch.setattr(proxy, "find_ready_cache_refs", find_ready)
+    monkeypatch.setattr(proxy, "fanout_encoder_primer", dispatch)
+    monkeypatch.setattr(proxy, "resolve_cache_refs", resolve)
+    monkeypatch.setattr(
+        proxy.app.state, "encoder_dispatch_policy", "always", raising=False
+    )
+    proxy.app.state.simulated_bandwidth_mbps = 0
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        return await proxy.prepare_multimodal_request(
+            request, ["http://encoder"], "always", started, started + 60
+        )
+
+    prepared = asyncio.run(check())
+
+    assert lookup_called is False
+    assert dispatched == {"image-a"}
+    assert prepared["cedfs_cache_refs"] == [_cache_ref("image-a")]
+
+
 def test_formula_delay_admission_rejects_request_that_cannot_meet_deadline():
     proxy.app.state.request_timeout_ms = 60_000
     proxy.app.state.simulated_bandwidth_mbps = 200

@@ -173,24 +173,48 @@ def sanitize_for_pd(request_data: dict, cache_refs: list[dict]) -> dict:
     return sanitized
 
 
-async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
+def _cache_ref(identifier: str, value: dict) -> dict:
+    meta = value["meta"]
+    return {
+        "version": 1,
+        "mm_hash": identifier,
+        "model_scope": value["model_scope"],
+        "sha256": meta["sha256"],
+        "num_encoder_token": meta.get("num_encoder_token"),
+        "payload_size": meta.get("payload_size"),
+        "ino": (value.get("location") or {}).get("ino"),
+    }
+
+
+async def find_ready_cache_refs(identifiers: list[str]) -> dict[str, dict]:
     client = getattr(app.state, "cedfs_client", None)
     scopes = getattr(app.state, "candidate_scopes", [])
     if not identifiers:
-        return []
+        return {}
     if client is None or not scopes:
         raise RuntimeError("CedFS cache_ref resolver is not configured")
+    values = await asyncio.to_thread(
+        client.batch_find_first_ready, scopes, identifiers, []
+    )
+    return {
+        identifier: _cache_ref(identifier, value)
+        for identifier in identifiers
+        if (value := values.get(identifier)) is not None
+    }
+
+
+async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
+    if not identifiers:
+        return []
     timeout_ms = app.state.cache_ready_timeout_ms
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
     pending = list(identifiers)
     resolved = {}
     while pending:
-        values = await asyncio.to_thread(
-            client.batch_find_first_ready, scopes, pending, []
-        )
-        for identifier in list(pending):
-            if value := values.get(identifier):
-                resolved[identifier] = value
+        ready = await find_ready_cache_refs(pending)
+        for identifier, cache_ref in ready.items():
+            resolved[identifier] = cache_ref
+            if identifier in pending:
                 pending.remove(identifier)
         if not pending:
             break
@@ -202,24 +226,13 @@ async def resolve_cache_refs(identifiers: list[str]) -> list[dict]:
 
     refs = []
     for identifier in identifiers:
-        value = resolved[identifier]
-        meta = value["meta"]
+        cache_ref = resolved[identifier]
         logger.info(
             "Resolved CedFS cache_ref: mm_hash=%s model_scope=%s",
             identifier,
-            value["model_scope"],
+            cache_ref["model_scope"],
         )
-        refs.append(
-            {
-                "version": 1,
-                "mm_hash": identifier,
-                "model_scope": value["model_scope"],
-                "sha256": meta["sha256"],
-                "num_encoder_token": meta.get("num_encoder_token"),
-                "payload_size": meta.get("payload_size"),
-                "ino": (value.get("location") or {}).get("ino"),
-            }
-        )
+        refs.append(cache_ref)
     return refs
 
 
@@ -268,6 +281,7 @@ async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
     req_id: str,
+    identifiers_to_encode: set[str] | None = None,
 ) -> list[str]:
     """
     1. Build one request *per MM item* with all text removed.
@@ -276,7 +290,12 @@ async def fanout_encoder_primer(
     """
     logger.info("[%s] Processing multimodal items...", req_id)
 
-    mm_items = extract_mm_items(orig_request)
+    mm_items = [
+        item
+        for item in extract_mm_items(orig_request)
+        if identifiers_to_encode is None
+        or str(item["uuid"]) in identifiers_to_encode
+    ]
     if not mm_items:
         logger.info("[%s] No multimodal items, skipping encoder", req_id)
         return []  # nothing to do
@@ -344,6 +363,65 @@ async def fanout_encoder_primer(
         "[%s] All %d encoder requests completed successfully", req_id, len(mm_items)
     )
     return [str(item["uuid"]) for item in mm_items]
+
+
+async def prepare_multimodal_request(
+    req_data: dict,
+    e_urls: list[str],
+    req_id: str,
+    request_started: float,
+    deadline: float,
+) -> dict:
+    identifiers = assign_mm_identifiers(req_data)
+    if not identifiers:
+        return req_data
+
+    policy = getattr(app.state, "encoder_dispatch_policy", "always")
+    ready_refs: dict[str, dict] = {}
+    missing = list(identifiers)
+    if policy != "always":
+        ready_refs = await find_ready_cache_refs(identifiers)
+        missing = [
+            identifier for identifier in identifiers if identifier not in ready_refs
+        ]
+        logger.info(
+            "Encoder dispatch decision: request_id=%s policy=%s hit_count=%d "
+            "miss_count=%d dispatched_count=%d",
+            req_id,
+            policy,
+            len(identifiers) - len(missing),
+            len(missing),
+            0 if policy == "ready-only" else len(missing),
+        )
+        _log_timeline(req_id, "cache_lookup_done", request_started, deadline)
+        if missing and policy == "ready-only":
+            raise HTTPException(
+                status_code=424,
+                detail={
+                    "type": "cedfs_ready_cache_miss",
+                    "request_id": req_id,
+                    "missing_mm_hashes": missing,
+                },
+            )
+
+    if missing:
+        await fanout_encoder_primer(req_data, e_urls, req_id, set(missing))
+        _log_timeline(req_id, "encoder_done", request_started, deadline)
+        produced_refs = await resolve_cache_refs(missing)
+        ready_refs.update({ref["mm_hash"]: ref for ref in produced_refs})
+    else:
+        logger.info(
+            "[%s] Encoder skipped: policy=%s ready_count=%d",
+            req_id,
+            policy,
+            len(ready_refs),
+        )
+        _log_timeline(req_id, "encoder_skipped", request_started, deadline)
+
+    cache_refs = [ready_refs[identifier] for identifier in identifiers]
+    _log_timeline(req_id, "cache_ref_ready", request_started, deadline)
+    ensure_ec_deadline_admission(cache_refs, req_id, deadline)
+    return sanitize_for_pd(req_data, cache_refs)
 
 
 async def maybe_prefill(
@@ -530,15 +608,10 @@ async def forward_non_stream(
 ) -> dict:
     try:
         async with asyncio.timeout_at(deadline):
-            # Step 1: Process through Encoder instance (if has MM input)
-            assign_mm_identifiers(req_data)
-            identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
-            _log_timeline(req_id, "encoder_done", request_started, deadline)
-            if identifiers:
-                cache_refs = await resolve_cache_refs(identifiers)
-                _log_timeline(req_id, "cache_ref_ready", request_started, deadline)
-                ensure_ec_deadline_admission(cache_refs, req_id, deadline)
-                req_data = sanitize_for_pd(req_data, cache_refs)
+            # Step 1: Resolve ready ECs or dispatch only the required Encoder work.
+            req_data = await prepare_multimodal_request(
+                req_data, e_urls, req_id, request_started, deadline
+            )
 
             # Step 2: Process through Prefill instance
             req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -597,15 +670,10 @@ async def forward_stream(
 ) -> AsyncIterator[str]:
     try:
         async with asyncio.timeout_at(deadline):
-            # Step 1: Process through Encoder instance (if has MM input)
-            assign_mm_identifiers(req_data)
-            identifiers = await fanout_encoder_primer(req_data, e_urls, req_id)
-            _log_timeline(req_id, "encoder_done", request_started, deadline)
-            if identifiers:
-                cache_refs = await resolve_cache_refs(identifiers)
-                _log_timeline(req_id, "cache_ref_ready", request_started, deadline)
-                ensure_ec_deadline_admission(cache_refs, req_id, deadline)
-                req_data = sanitize_for_pd(req_data, cache_refs)
+            # Step 1: Resolve ready ECs or dispatch only the required Encoder work.
+            req_data = await prepare_multimodal_request(
+                req_data, e_urls, req_id, request_started, deadline
+            )
 
             # Step 2: Process through Prefill instance
             req_data = await maybe_prefill(req_data, p_url, req_id)
@@ -700,8 +768,9 @@ async def chat_completions(request: Request):
         app.state.decode_rr_index = decode_rr_index + 1
         d_url = app.state.d_urls[decode_index]
         logger.info(
-            "[%s] Routing request to encoder_start=%s decode=%s",
+            "[%s] Routing request with encoder_policy=%s encoder_start=%s decode=%s",
             req_id,
+            app.state.encoder_dispatch_policy,
             e_urls[0],
             d_url,
         )
@@ -905,6 +974,15 @@ if __name__ == "__main__":
         help="Maximum concurrent Proxy-to-Encoder requests (0 means unlimited)",
     )
     parser.add_argument(
+        "--encoder-dispatch-policy",
+        choices=("always", "lookup-first", "ready-only"),
+        default="always",
+        help=(
+            "Encoder dispatch policy: always preserves the historical path; "
+            "lookup-first encodes only CedFS misses; ready-only fails on any miss"
+        ),
+    )
+    parser.add_argument(
         "--cedfs-config",
         help="CedFS client TOML used by the proxy-side cache_ref resolver",
     )
@@ -943,6 +1021,7 @@ if __name__ == "__main__":
         u.strip() for u in args.decode_servers_urls.split(",") if u.strip()
     ]
     app.state.max_encoder_inflight = max(0, args.max_encoder_inflight)
+    app.state.encoder_dispatch_policy = args.encoder_dispatch_policy
     app.state.encoder_rr_index = 0
     app.state.decode_rr_index = 0
     app.state.candidate_scopes = [
@@ -975,6 +1054,7 @@ if __name__ == "__main__":
 
     logger.info("Proxy listening on %s:%s", args.host, args.port)
     logger.info("Encode servers: %s", app.state.e_urls)
+    logger.info("Encoder dispatch policy: %s", app.state.encoder_dispatch_policy)
     logger.info("Maximum encoder inflight: %s", app.state.max_encoder_inflight or "unlimited")
     logger.info("Prefill instances %s", app.state.p_urls)
     logger.info("Decode servers: %s", app.state.d_urls)
