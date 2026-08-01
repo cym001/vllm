@@ -47,6 +47,12 @@ class ECConnectorRole(enum.Enum):
     WORKER = 1
 
 
+class ECCacheAvailability(enum.Enum):
+    READY = "ready"
+    PENDING = "pending"
+    FAILED = "failed"
+
+
 class ECConnectorMetadata(ABC):  # noqa: B024
     """
     Abstract Metadata used to communicate between the
@@ -182,6 +188,10 @@ class ECConnectorBase(ABC):
         """
         return None, None
 
+    def get_failed(self) -> dict[str, str] | None:
+        """Return and drain asynchronous encoder-cache load failures."""
+        return None
+
     # ==============================
     # Scheduler-side methods
     # ==============================
@@ -202,6 +212,26 @@ class ECConnectorBase(ABC):
             the media
         """
         pass
+
+    def get_cache_availability(self, identifier: str) -> ECCacheAvailability:
+        """Return a non-blocking snapshot of remote encoder-cache readiness."""
+        if self.has_cache_item(identifier):
+            return ECCacheAvailability.READY
+        return ECCacheAvailability.FAILED
+
+    def requires_external_cache(self) -> bool:
+        """Whether a remote miss must never fall back to local encoder compute."""
+        return False
+
+    def supports_async_load(self) -> bool:
+        """Whether the connector can stage encoder caches outside model forward."""
+        return False
+
+    def is_async_load_finished(self, identifier: str) -> bool:
+        return True
+
+    def update_state_for_async_load(self, request: "Request", index: int) -> None:
+        self.update_state_after_alloc(request, index)
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):
