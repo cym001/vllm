@@ -320,12 +320,15 @@ class ECConnectorOutput:
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
     ec_connector_worker_meta: ECConnectorWorkerMetadata | None = None
+    # mm_hash -> worker-side load failure reason
+    failed_recving: dict[str, str] | None = None
 
     def is_empty(self):
         return (
             not self.finished_sending
             and not self.finished_recving
             and not self.ec_connector_worker_meta
+            and not self.failed_recving
         )
 
 
