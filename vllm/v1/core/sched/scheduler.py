@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 import vllm.envs as envs
+from vllm.cedfs_trace import log_cedfs_ttft_event
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -204,6 +205,7 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
         self.pending_ec_loads: dict[str, set[str]] = {}
+        self._cedfs_trace_scheduled_requests: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -554,6 +556,9 @@ class Scheduler(SchedulerInterface):
                     self.ec_connector.update_state_for_async_load(request, i)
                     required_hashes.add(request.mm_features[i].identifier)
                 self.pending_ec_loads[request.request_id] = required_hashes
+                log_cedfs_ttft_event(
+                    logger, request.request_id, "tensor_lookup_start"
+                )
                 self.running.pop(req_index)
                 request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
                 self.skipped_waiting.add_request(request)
@@ -1059,6 +1064,11 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if request.request_id not in self._cedfs_trace_scheduled_requests:
+                        self._cedfs_trace_scheduled_requests.add(request.request_id)
+                        log_cedfs_ttft_event(
+                            logger, request.request_id, "engine_scheduled"
+                        )
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -2335,6 +2345,7 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             self.pending_ec_loads.pop(request.request_id, None)
+            self._cedfs_trace_scheduled_requests.discard(request.request_id)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2753,6 +2764,9 @@ class Scheduler(SchedulerInterface):
             ):
                 return False
             self.pending_ec_loads.pop(request.request_id, None)
+            log_cedfs_ttft_event(
+                logger, request.request_id, "tensor_h2d_done"
+            )
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
