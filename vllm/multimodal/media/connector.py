@@ -352,10 +352,11 @@ class MediaConnector:
         *,
         fetch_timeout: int | None = None,
     ) -> _M:  # type: ignore[type-var]
-        source_scheme = (
-            "data" if url[:5].lower() == "data:" else parse_url(url).scheme
-        )
-        logger.info("vLLM media access: source_scheme=%s", source_scheme)
+        if envs.CEDFS_TRACE:
+            source_scheme = (
+                "data" if url[:5].lower() == "data:" else parse_url(url).scheme
+            )
+            logger.info("vLLM media access: source_scheme=%s", source_scheme)
         if url[:5].lower() == "data:":
             return self._load_data_url(url, media_io)
 
@@ -398,10 +399,11 @@ class MediaConnector:
         fetch_timeout: int | None = None,
     ) -> _M:
         loop = asyncio.get_running_loop()
-        source_scheme = (
-            "data" if url[:5].lower() == "data:" else parse_url(url).scheme
-        )
-        logger.info("vLLM media access: source_scheme=%s", source_scheme)
+        if envs.CEDFS_TRACE:
+            source_scheme = (
+                "data" if url[:5].lower() == "data:" else parse_url(url).scheme
+            )
+            logger.info("vLLM media access: source_scheme=%s", source_scheme)
 
         if url[:5].lower() == "data:":
             future = loop.run_in_executor(

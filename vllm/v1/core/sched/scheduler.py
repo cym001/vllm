@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -1515,6 +1516,14 @@ class Scheduler(SchedulerInterface):
                 if self.encoder_cache_manager.check_and_update_cache(request, i):
                     # The encoder input is already computed and cached from a
                     # previous step.
+                    if envs.CEDFS_TRACE:
+                        logger.info(
+                            "CedFS EC local cache hit: request_id=%s "
+                            "mm_hash=%s input_id=%d source=encoder_cache",
+                            request.request_id,
+                            item_identifier,
+                            i,
+                        )
                     continue
 
             # If no encoder input chunking is allowed, we do not want to
