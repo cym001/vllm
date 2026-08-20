@@ -265,6 +265,8 @@ class OpenAIServingChat(GenerateBaseServing):
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
         log_cedfs_ttft_event(logger, request_id, "api_receive")
+        # FastAPI/Pydantic has validated the JSON body before this handler.
+        log_cedfs_ttft_event(logger, request_id, "pd_api_parsed")
 
         # Streaming response
         tokenizer = self.renderer.tokenizer
@@ -284,6 +286,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         conversation, engine_inputs = result
 
+        log_cedfs_ttft_event(logger, request_id, "mm_processor_done")
         log_cedfs_ttft_event(logger, request_id, "api_request_built")
 
         request_metadata = RequestResponseMetadata(request_id=request_id)

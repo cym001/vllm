@@ -3614,6 +3614,9 @@ class GPUModelRunner(
                 if request.req_id not in self._cedfs_trace_prompt_embeddings:
                     self._cedfs_trace_prompt_embeddings.add(request.req_id)
                     log_cedfs_ttft_event(
+                        logger, request.req_id, "embedding_merge_done"
+                    )
+                    log_cedfs_ttft_event(
                         logger, request.req_id, "prompt_embedding_built"
                     )
 
