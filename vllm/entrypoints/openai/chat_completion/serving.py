@@ -3,6 +3,7 @@
 
 import asyncio
 import io
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -55,9 +56,10 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
-from vllm.inputs import EngineInput, MultiModalPlaceholders
+from vllm.inputs import EngineInput, MultiModalPlaceholders, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.multimodal.inputs import MultiModalKwargsItems, PlaceholderRange
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
@@ -280,13 +282,17 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
-        result = await self.render_chat_request(request)
-        if isinstance(result, ErrorResponse):
-            return result
-
-        conversation, engine_inputs = result
-
-        log_cedfs_ttft_event(logger, request_id, "mm_processor_done")
+        if request.cedfs_mm_features is not None:
+            try:
+                conversation, engine_inputs = self._build_cedfs_native_inputs(request)
+            except ValueError as exc:
+                return self.create_error_response(str(exc))
+        else:
+            result = await self.render_chat_request(request)
+            if isinstance(result, ErrorResponse):
+                return result
+            conversation, engine_inputs = result
+            log_cedfs_ttft_event(logger, request_id, "mm_processor_done")
         log_cedfs_ttft_event(logger, request_id, "api_request_built")
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -415,6 +421,61 @@ class OpenAIServingChat(GenerateBaseServing):
             parser=parser,
             mm_token_counts=mm_token_counts,
         )
+
+    @staticmethod
+    def _build_cedfs_native_inputs(request: ChatCompletionRequest):
+        features = request.cedfs_mm_features
+        token_ids = request.cedfs_prompt_token_ids
+        if not features or not token_ids or any(token < 0 for token in token_ids):
+            raise ValueError("CedFS native request requires valid prompt tokens and features")
+
+        expected_scopes = {
+            scope for scope in os.getenv("CEDFS_MODEL_SCOPES", "").split(",") if scope
+        }
+        expected_fingerprint = os.getenv("CEDFS_COMPATIBILITY_FINGERPRINT", "")
+        expected_epoch = os.getenv("CEDFS_OWNERSHIP_EPOCH", "")
+        expected_device = os.getenv("CEDFS_DEVICE_KEY", "")
+        if not (
+            expected_scopes and expected_fingerprint and expected_epoch and expected_device
+        ):
+            raise ValueError("CedFS native PD compatibility context is not configured")
+
+        mm_hashes: dict[str, list[str]] = {}
+        mm_kwargs: dict[str, list[None]] = {}
+        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
+        spans: list[tuple[int, int]] = []
+        for feature in features:
+            if feature.model_scope not in expected_scopes:
+                raise ValueError("CedFS native model_scope mismatch")
+            if feature.compatibility_fingerprint != expected_fingerprint:
+                raise ValueError("CedFS native compatibility_fingerprint mismatch")
+            if str(feature.ownership_epoch) != expected_epoch:
+                raise ValueError("CedFS native ownership_epoch mismatch")
+            if feature.device_key != expected_device:
+                raise ValueError("CedFS native device_key mismatch")
+            end = feature.position_offset + feature.position_length
+            if end > len(token_ids):
+                raise ValueError("CedFS native placeholder exceeds prompt length")
+            spans.append((feature.position_offset, end))
+            mm_hashes.setdefault(feature.modality, []).append(feature.mm_hash)
+            mm_kwargs.setdefault(feature.modality, []).append(None)
+            mm_placeholders.setdefault(feature.modality, []).append(
+                PlaceholderRange(
+                    offset=feature.position_offset,
+                    length=feature.position_length,
+                )
+            )
+        ordered_spans = sorted(spans)
+        if any(cur[0] < prev[1] for prev, cur in zip(ordered_spans, ordered_spans[1:])):
+            raise ValueError("CedFS native multimodal placeholders overlap")
+        return [], [
+            mm_input(
+                prompt_token_ids=token_ids,
+                mm_kwargs=MultiModalKwargsItems(mm_kwargs),
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+            )
+        ]
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:

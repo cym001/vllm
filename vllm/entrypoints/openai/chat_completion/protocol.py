@@ -193,10 +193,38 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class CedfsMMFeatureParam(OpenAIBaseModel):
+    version: Literal[1] = 1
+    mm_hash: str = Field(min_length=1)
+    model_scope: str = Field(min_length=1)
+    num_encoder_tokens: int = Field(gt=0)
+    tensor_shape: list[int] = Field(min_length=1)
+    tensor_dtype: str = Field(min_length=1)
+    compatibility_fingerprint: str = Field(min_length=1)
+    ownership_epoch: int = Field(ge=0)
+    device_key: str = Field(min_length=1)
+    modality: str = Field(min_length=1)
+    position_offset: int = Field(ge=0)
+    position_length: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_native_shape_and_position(self):
+        if any(dimension <= 0 for dimension in self.tensor_shape):
+            raise ValueError("tensor_shape dimensions must be positive")
+        if self.position_length != self.num_encoder_tokens:
+            raise ValueError("position_length must equal num_encoder_tokens")
+        return self
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
+    # CedFS internal-only fast path. The API validates this metadata against
+    # its configured scope/fingerprint/epoch/device before bypassing MM input.
+    cedfs_prompt_token_ids: list[int] | None = None
+    cedfs_mm_features: list[CedfsMMFeatureParam] | None = None
+    cedfs_sampling_params: dict[str, Any] | None = None
     model: str | None = None
     frequency_penalty: float | None = 0.0
     logit_bias: dict[str, float] | None = None
