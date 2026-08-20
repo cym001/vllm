@@ -47,3 +47,23 @@ def test_cedfs_trace_preserves_external_request_id(monkeypatch):
 
     assert request.request_id == "bench-7"
     assert request.external_req_id == "bench-7"
+
+
+def test_cedfs_trace_accepts_hot_path_phase_events(monkeypatch):
+    monkeypatch.setenv("CEDFS_TRACE", "1")
+    logger = Mock()
+
+    for event in (
+        "pd_api_parsed",
+        "mm_processor_done",
+        "encoder_cache_attached",
+        "embedding_merge_done",
+    ):
+        log_cedfs_ttft_event(logger, "bench-7", event)
+
+    assert [call.args[2] for call in logger.info.call_args_list] == [
+        "pd_api_parsed",
+        "mm_processor_done",
+        "encoder_cache_attached",
+        "embedding_merge_done",
+    ]

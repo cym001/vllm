@@ -3042,6 +3042,9 @@ class Scheduler(SchedulerInterface):
             log_cedfs_ttft_event(
                 logger, request.request_id, "tensor_h2d_done"
             )
+            log_cedfs_ttft_event(
+                logger, request.request_id, "encoder_cache_attached"
+            )
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
