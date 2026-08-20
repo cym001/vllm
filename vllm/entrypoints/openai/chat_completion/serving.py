@@ -10,6 +10,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 
+from vllm.cedfs_trace import get_cedfs_request_id, log_cedfs_ttft_event
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -260,6 +261,14 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        cedfs_request_id = get_cedfs_request_id(
+            raw_request.headers if raw_request is not None else None
+        )
+        request_id = cedfs_request_id or (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        log_cedfs_ttft_event(logger, request_id, "api_receive")
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -278,9 +287,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         conversation, engine_inputs = result
 
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
+        log_cedfs_ttft_event(logger, request_id, "api_request_built")
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:

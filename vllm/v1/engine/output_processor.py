@@ -10,6 +10,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.cedfs_trace import log_cedfs_ttft_event
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -43,6 +45,7 @@ from vllm.v1.outputs import SamplingMaskLists
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+logger = init_logger(__name__)
 
 
 class RequestOutputCollector:
@@ -666,6 +669,8 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+            if req_state.is_prefilling and new_token_ids:
+                log_cedfs_ttft_event(logger, req_id, "first_token")
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts

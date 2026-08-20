@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.cedfs_trace import log_cedfs_ttft_event
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -723,6 +724,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._cedfs_trace_prompt_embeddings: set[str] = set()
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1214,6 +1216,7 @@ class GPUModelRunner(
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._cedfs_trace_prompt_embeddings.discard(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -3688,6 +3691,14 @@ class GPUModelRunner(
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
+
+        if is_first_rank and is_global_first_rank():
+            for request in scheduler_output.scheduled_new_reqs:
+                if request.req_id not in self._cedfs_trace_prompt_embeddings:
+                    self._cedfs_trace_prompt_embeddings.add(request.req_id)
+                    log_cedfs_ttft_event(
+                        logger, request.req_id, "prompt_embedding_built"
+                    )
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
