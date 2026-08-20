@@ -70,6 +70,8 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
 
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
+
 logger = init_logger(__name__)
 
 
@@ -269,6 +271,13 @@ class OpenAIServingChat(GenerateBaseServing):
         log_cedfs_ttft_event(logger, request_id, "api_receive")
         # FastAPI/Pydantic has validated the JSON body before this handler.
         log_cedfs_ttft_event(logger, request_id, "pd_api_parsed")
+        if request.cedfs_mm_features is not None:
+            try:
+                self._validate_cedfs_route_token(
+                    request, raw_request.headers if raw_request is not None else {}
+                )
+            except (RouteTokenError, ValueError) as exc:
+                return self.create_error_response(str(exc))
 
         # Streaming response
         tokenizer = self.renderer.tokenizer
@@ -476,6 +485,35 @@ class OpenAIServingChat(GenerateBaseServing):
                 mm_placeholders=mm_placeholders,
             )
         ]
+
+    @staticmethod
+    def _validate_cedfs_route_token(request: ChatCompletionRequest, headers) -> None:
+        if os.getenv("CEDFS_REQUIRE_ROUTE_TOKEN", "0").lower() not in ("1", "true"):
+            return
+        token = headers.get("x-cedfs-route-token")
+        secret = os.getenv("CEDFS_ROUTE_TOKEN_SECRET", "")
+        owner_pd = os.getenv("CEDFS_PD_ID", "")
+        features = request.cedfs_mm_features or []
+        if not token:
+            raise RouteTokenError("missing CedFS route token")
+        if not secret or not owner_pd or not features:
+            raise RouteTokenError("CedFS direct-PD token context is not configured")
+        scopes = {feature.model_scope for feature in features}
+        fingerprints = {
+            feature.compatibility_fingerprint for feature in features
+        }
+        epochs = {feature.ownership_epoch for feature in features}
+        if len(scopes) != 1 or len(fingerprints) != 1 or len(epochs) != 1:
+            raise RouteTokenError("CedFS native features have mixed compatibility identity")
+        RouteTokenSigner(secret).verify(
+            token,
+            model=str(request.model or ""),
+            model_scope=next(iter(scopes)),
+            compatibility_fingerprint=next(iter(fingerprints)),
+            ownership_epoch=next(iter(epochs)),
+            owner_pd=owner_pd,
+            media_hashes=[feature.mm_hash for feature in features],
+        )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
