@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 
 
 def _feature(**overrides):
@@ -104,4 +105,49 @@ def test_native_request_rejects_overlapping_positions():
     with pytest.raises(ValueError, match="overlap"):
         OpenAIServingChat._build_cedfs_native_inputs(
             _request([_feature(position_offset=2), _feature(position_offset=4)])
+        )
+
+
+def test_direct_pd_route_token_is_required_and_bound(monkeypatch):
+    secret = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CEDFS_REQUIRE_ROUTE_TOKEN", "1")
+    monkeypatch.setenv("CEDFS_ROUTE_TOKEN_SECRET", secret)
+    monkeypatch.setenv("CEDFS_PD_ID", "1")
+    token, _claims = RouteTokenSigner(secret).issue(
+        model="test",
+        model_scope="scope-a",
+        compatibility_fingerprint="fingerprint-a",
+        ownership_epoch=7,
+        owner_pd="1",
+        media_hashes=["image-a"],
+    )
+
+    OpenAIServingChat._validate_cedfs_route_token(
+        _request(), {"x-cedfs-route-token": token}
+    )
+    with pytest.raises(RouteTokenError, match="missing"):
+        OpenAIServingChat._validate_cedfs_route_token(_request(), {})
+
+
+def test_direct_pd_rejects_wrong_owner_and_tampering(monkeypatch):
+    secret = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CEDFS_REQUIRE_ROUTE_TOKEN", "1")
+    monkeypatch.setenv("CEDFS_ROUTE_TOKEN_SECRET", secret)
+    monkeypatch.setenv("CEDFS_PD_ID", "0")
+    token, _claims = RouteTokenSigner(secret).issue(
+        model="test",
+        model_scope="scope-a",
+        compatibility_fingerprint="fingerprint-a",
+        ownership_epoch=7,
+        owner_pd="1",
+        media_hashes=["image-a"],
+    )
+
+    with pytest.raises(RouteTokenError, match="owner_pd mismatch"):
+        OpenAIServingChat._validate_cedfs_route_token(
+            _request(), {"x-cedfs-route-token": token}
+        )
+    with pytest.raises(RouteTokenError, match="signature"):
+        OpenAIServingChat._validate_cedfs_route_token(
+            _request(), {"x-cedfs-route-token": token[:-1] + "A"}
         )
