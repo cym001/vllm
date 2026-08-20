@@ -1513,10 +1513,14 @@ class Scheduler(SchedulerInterface):
                     # current step.
                     continue
 
+                already_recorded = (
+                    i
+                    in self.encoder_cache_manager.get_cached_input_ids(request)
+                )
                 if self.encoder_cache_manager.check_and_update_cache(request, i):
                     # The encoder input is already computed and cached from a
                     # previous step.
-                    if envs.CEDFS_TRACE:
+                    if envs.CEDFS_TRACE and not already_recorded:
                         logger.info(
                             "CedFS EC local cache hit: request_id=%s "
                             "mm_hash=%s input_id=%d source=encoder_cache",
