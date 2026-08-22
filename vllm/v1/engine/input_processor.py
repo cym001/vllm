@@ -363,6 +363,9 @@ class InputProcessor:
                         ),
                         mm_position=decoder_mm_positions[modality][idx],
                         mm_hash=base_mm_hash,
+                        external_cache_only=decoder_inputs.get(
+                            "external_cache_only", False
+                        ),
                     )
                 )
 

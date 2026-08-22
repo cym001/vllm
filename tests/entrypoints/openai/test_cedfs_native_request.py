@@ -20,6 +20,7 @@ def _feature(**overrides):
         "modality": "image",
         "position_offset": 2,
         "position_length": 4,
+        "grid_thw": [1, 2, 8],
     }
     value.update(overrides)
     return value
@@ -52,8 +53,11 @@ def test_native_request_builds_cache_only_engine_input():
     assert len(engine_inputs) == 1
     engine_input = engine_inputs[0]
     assert engine_input["prompt_token_ids"] == list(range(12))
+    assert engine_input["external_cache_only"] is True
     assert engine_input["mm_hashes"] == {"image": ["image-a"]}
-    assert engine_input["mm_kwargs"]["image"] == [None]
+    grid_item = engine_input["mm_kwargs"]["image"][0]
+    assert grid_item["image_grid_thw"].data.tolist() == [1, 2, 8]
+    assert grid_item["image_grid_thw"].field.keep_on_cpu is True
     assert engine_input["mm_placeholders"]["image"][0].offset == 2
 
 

@@ -206,6 +206,7 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
     modality: str = Field(min_length=1)
     position_offset: int = Field(ge=0)
     position_length: int = Field(gt=0)
+    grid_thw: list[int] = Field(min_length=3, max_length=3)
 
     @model_validator(mode="after")
     def _validate_native_shape_and_position(self):
@@ -213,6 +214,10 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
             raise ValueError("tensor_shape dimensions must be positive")
         if self.position_length != self.num_encoder_tokens:
             raise ValueError("position_length must equal num_encoder_tokens")
+        if any(dimension <= 0 for dimension in self.grid_thw):
+            raise ValueError("grid_thw dimensions must be positive")
+        if self.modality == "image" and self.grid_thw[0] != 1:
+            raise ValueError("image grid_thw temporal dimension must equal 1")
         return self
 
 
