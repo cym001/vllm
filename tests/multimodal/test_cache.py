@@ -755,6 +755,25 @@ def test_processor_cache_shared_across_loras():
     assert feature_lora_b.data == item_data
 
 
+def test_external_encoder_cache_feature_bypasses_processor_receiver_cache():
+    model_config = ModelConfig(
+        model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+        mm_processor_cache_gb=1,
+    )
+    receiver_cache = MultiModalReceiverCache(model_config)
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="external-image",
+        mm_position=PlaceholderRange(offset=0, length=4),
+        mm_hash="external-image",
+        external_cache_only=True,
+    )
+
+    assert receiver_cache.get_and_update_features([feature]) == [feature]
+    assert receiver_cache._cache.get("external-image") is None
+
+
 _SLEEP_VISION_PROMPT = (
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
     "\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"

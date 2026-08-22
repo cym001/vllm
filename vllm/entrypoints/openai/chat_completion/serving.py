@@ -10,6 +10,9 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
 
+import numpy as np
+import pybase64 as base64
+import torch
 from fastapi import Request
 
 from vllm.cedfs_trace import get_cedfs_request_id, log_cedfs_ttft_event
@@ -61,7 +64,13 @@ from vllm.exceptions import GenerationError
 from vllm.inputs import EngineInput, MultiModalPlaceholders, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.multimodal.inputs import MultiModalKwargsItems, PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    MultiModalKwargsItems,
+    PlaceholderRange,
+)
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
@@ -459,7 +468,7 @@ class OpenAIServingChat(GenerateBaseServing):
             raise ValueError("CedFS native PD compatibility context is not configured")
 
         mm_hashes: dict[str, list[str]] = {}
-        mm_kwargs: dict[str, list[None]] = {}
+        mm_kwargs: dict[str, list[MultiModalKwargsItem]] = {}
         mm_placeholders: dict[str, list[PlaceholderRange]] = {}
         spans: list[tuple[int, int]] = []
         for feature in features:
@@ -476,7 +485,20 @@ class OpenAIServingChat(GenerateBaseServing):
                 raise ValueError("CedFS native placeholder exceeds prompt length")
             spans.append((feature.position_offset, end))
             mm_hashes.setdefault(feature.modality, []).append(feature.mm_hash)
-            mm_kwargs.setdefault(feature.modality, []).append(None)
+            grid_key = (
+                "image_grid_thw"
+                if feature.modality == "image"
+                else f"{feature.modality}_grid_thw"
+            )
+            grid_item = MultiModalKwargsItem(
+                {
+                    grid_key: MultiModalFieldElem(
+                        data=torch.tensor(feature.grid_thw, dtype=torch.long),
+                        field=MultiModalBatchedField(keep_on_cpu=True),
+                    )
+                }
+            )
+            mm_kwargs.setdefault(feature.modality, []).append(grid_item)
             mm_placeholders.setdefault(feature.modality, []).append(
                 PlaceholderRange(
                     offset=feature.position_offset,
@@ -492,6 +514,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 mm_kwargs=MultiModalKwargsItems(mm_kwargs),
                 mm_hashes=mm_hashes,
                 mm_placeholders=mm_placeholders,
+                external_cache_only=True,
             )
         ]
 

@@ -158,6 +158,9 @@ class MultiModalInput(_InputOptions):
     `prompt_token_ids`.
     """
 
+    external_cache_only: NotRequired[bool]
+    """Skip the processor receiver cache; encoder data comes from EC."""
+
     assistant_tokens_mask: NotRequired[list[int] | None]
     """Per-token 0/1 mask marking assistant-generated tokens.
     Populated when ``return_assistant_tokens_mask=True`` is set on the
@@ -172,6 +175,7 @@ def mm_input(
     *,
     prompt: str | None = None,
     cache_salt: str | None = None,
+    external_cache_only: bool = False,
 ) -> MultiModalInput:
     inputs = MultiModalInput(
         type="multimodal",
@@ -185,6 +189,8 @@ def mm_input(
         inputs["prompt"] = prompt
     if cache_salt is not None:
         inputs["cache_salt"] = cache_salt
+    if external_cache_only:
+        inputs["external_cache_only"] = True
 
     return inputs
 
