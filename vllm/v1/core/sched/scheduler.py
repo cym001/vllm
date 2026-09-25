@@ -1943,8 +1943,6 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
-        if ec_connector_output and self.ec_connector is not None:
-            self.ec_connector.update_connector_output(ec_connector_output)
         failed_ec_requests: list[Request] = []
         if ec_connector_output and ec_connector_output.failed_recving:
             failed_hashes = set(ec_connector_output.failed_recving)
