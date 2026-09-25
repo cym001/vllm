@@ -4,7 +4,11 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from vllm.cedfs_trace import get_cedfs_request_id, log_cedfs_ttft_event
+from vllm.cedfs_trace import (
+    TRACE_SCHEMA_VERSION,
+    get_cedfs_request_id,
+    log_cedfs_ttft_event,
+)
 from vllm.v1.engine.input_processor import InputProcessor
 
 
@@ -31,12 +35,13 @@ def test_cedfs_ttft_trace_uses_monotonic_clock(monkeypatch):
 
     args = logger.info.call_args.args
     assert args[:3] == (
-        "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d",
+        "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d trace_schema_version=%s",
         "bench-7",
         "engine_enqueue",
     )
     assert isinstance(args[3], int)
     assert args[3] > 0
+    assert args[4] == TRACE_SCHEMA_VERSION
 
 
 def test_cedfs_trace_preserves_external_request_id(monkeypatch):

@@ -649,7 +649,7 @@ class Scheduler(SchedulerInterface):
                     required_hashes.add(request.mm_features[i].identifier)
                 self.pending_ec_loads[request.request_id] = required_hashes
                 log_cedfs_ttft_event(
-                    logger, request.request_id, "tensor_lookup_start"
+                    logger, request.request_id, "ec_wait_start"
                 )
                 self.running.pop(req_index)
                 request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
@@ -3040,7 +3040,7 @@ class Scheduler(SchedulerInterface):
                 return False
             self.pending_ec_loads.pop(request.request_id, None)
             log_cedfs_ttft_event(
-                logger, request.request_id, "tensor_h2d_done"
+                logger, request.request_id, "ec_ready"
             )
             log_cedfs_ttft_event(
                 logger, request.request_id, "encoder_cache_attached"
