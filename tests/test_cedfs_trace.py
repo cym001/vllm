@@ -35,7 +35,10 @@ def test_cedfs_ttft_trace_uses_monotonic_clock(monkeypatch):
 
     args = logger.info.call_args.args
     assert args[:3] == (
-        "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d trace_schema_version=%s",
+        (
+            "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d "
+            "trace_schema_version=%s"
+        ),
         "bench-7",
         "engine_enqueue",
     )

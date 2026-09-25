@@ -810,7 +810,10 @@ if __name__ == "__main__":
 
     logger.info("Proxy listening on %s:%s", args.host, args.port)
     logger.info("Encode servers: %s", app.state.e_urls)
-    logger.info("Maximum encoder inflight: %s", app.state.max_encoder_inflight or "unlimited")
+    logger.info(
+        "Maximum encoder inflight: %s",
+        app.state.max_encoder_inflight or "unlimited",
+    )
     logger.info("Prefill instances %s", app.state.p_urls)
     logger.info("Decode servers: %s", app.state.d_urls)
 

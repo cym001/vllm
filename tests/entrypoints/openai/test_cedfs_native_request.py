@@ -1,9 +1,9 @@
 import pytest
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 
 
 def _feature(**overrides):

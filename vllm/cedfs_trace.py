@@ -27,7 +27,8 @@ def log_cedfs_ttft_event(logger: Logger, request_id: str, event: str) -> None:
     """
     if envs.CEDFS_TRACE:
         logger.info(
-            "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d trace_schema_version=%s",
+            "CedFS TTFT trace: request_id=%s event=%s monotonic_ns=%d "
+            "trace_schema_version=%s",
             request_id,
             event,
             time.monotonic_ns(),

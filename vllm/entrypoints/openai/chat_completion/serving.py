@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import io
 import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -10,9 +9,8 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
 
-import numpy as np
-import pybase64 as base64
 import torch
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 from fastapi import Request
 
 from vllm.cedfs_trace import get_cedfs_request_id, log_cedfs_ttft_event
@@ -79,8 +77,6 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
-
-from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 
 logger = init_logger(__name__)
 
@@ -454,7 +450,9 @@ class OpenAIServingChat(GenerateBaseServing):
         features = request.cedfs_mm_features
         token_ids = request.cedfs_prompt_token_ids
         if not features or not token_ids or any(token < 0 for token in token_ids):
-            raise ValueError("CedFS native request requires valid prompt tokens and features")
+            raise ValueError(
+                "CedFS native request requires valid prompt tokens and features"
+            )
 
         expected_scopes = {
             scope for scope in os.getenv("CEDFS_MODEL_SCOPES", "").split(",") if scope
@@ -463,7 +461,10 @@ class OpenAIServingChat(GenerateBaseServing):
         expected_epoch = os.getenv("CEDFS_OWNERSHIP_EPOCH", "")
         expected_device = os.getenv("CEDFS_DEVICE_KEY", "")
         if not (
-            expected_scopes and expected_fingerprint and expected_epoch and expected_device
+            expected_scopes
+            and expected_fingerprint
+            and expected_epoch
+            and expected_device
         ):
             raise ValueError("CedFS native PD compatibility context is not configured")
 
@@ -536,7 +537,9 @@ class OpenAIServingChat(GenerateBaseServing):
         }
         epochs = {feature.ownership_epoch for feature in features}
         if len(scopes) != 1 or len(fingerprints) != 1 or len(epochs) != 1:
-            raise RouteTokenError("CedFS native features have mixed compatibility identity")
+            raise RouteTokenError(
+                "CedFS native features have mixed compatibility identity"
+            )
         RouteTokenSigner(secret).verify(
             token,
             model=str(request.model or ""),
