@@ -26,6 +26,8 @@
 # limitations under the License.
 """Inference-only Qwen2.5-VL model compatible with HuggingFace weights."""
 
+import hashlib
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
@@ -103,6 +105,7 @@ from .interfaces import (
 )
 from .qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from .qwen2_vl import (
+    Qwen2VLMultiModalDataParser,
     Qwen2VLMultiModalProcessor,
     Qwen2VLProcessingInfo,
 )
@@ -1136,6 +1139,15 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+class Qwen2_5_VLMultiModalDataParser(Qwen2VLMultiModalDataParser):
+    @classmethod
+    def placeholder_metadata_fields(cls, modality: str) -> set[str]:
+        fields = super().placeholder_metadata_fields(modality)
+        if modality == "video":
+            fields.add("second_per_grid_ts")
+        return fields
+
+
 class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen2_5_VLConfig)
@@ -1145,6 +1157,13 @@ class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
             Qwen2_5_VLProcessor,
             use_fast=kwargs.pop("use_fast", True),
             **kwargs,
+        )
+
+    def get_data_parser(self):
+        return Qwen2_5_VLMultiModalDataParser(
+            self.get_hf_config().vision_config.spatial_merge_size,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
         )
 
 
@@ -1255,7 +1274,7 @@ class Qwen2_5_VLForConditionalGeneration(
 
     def iter_mm_grid_thw(
         self, mm_features: list[MultiModalFeatureSpec]
-    ) -> Iterator[tuple[int, int, int, int, float]]:
+    ) -> Iterator[tuple[int, int, int, int, float, int]]:
         """
         Iterate over multimodal features and yield grid information.
 
@@ -1272,7 +1291,14 @@ class Qwen2_5_VLForConditionalGeneration(
             if mm_feature.modality == "image":
                 t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
                 assert t == 1, f"Image must have 1 frame, got {t}"
-                yield offset, 1, h // spatial_merge_size, w // spatial_merge_size, 1.0
+                yield (
+                    offset,
+                    1,
+                    h // spatial_merge_size,
+                    w // spatial_merge_size,
+                    1.0,
+                    mm_feature.mm_position.length,
+                )
             elif mm_feature.modality == "video":
                 t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
                 second_per_grid_ts = 1.0
@@ -1287,6 +1313,7 @@ class Qwen2_5_VLForConditionalGeneration(
                     h // spatial_merge_size,
                     w // spatial_merge_size,
                     t_factor,
+                    mm_feature.mm_position.length,
                 )
             else:
                 raise ValueError(f"Unsupported modality: {mm_feature.modality}")
@@ -1305,8 +1332,11 @@ class Qwen2_5_VLForConditionalGeneration(
             llm_grid_h,
             llm_grid_w,
             t_factor,
+            placeholder_length,
         ) in self.iter_mm_grid_thw(mm_features):
             text_len = offset - st
+            if text_len < 0:
+                raise ValueError("multimodal placeholder ranges overlap")
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
                 np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
@@ -1315,8 +1345,16 @@ class Qwen2_5_VLForConditionalGeneration(
             grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
             if t_factor != 1.0:
                 grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+            media_positions = grid_indices.reshape(3, -1)
+            if placeholder_length > media_positions.shape[1]:
+                raise ValueError("multimodal placeholder exceeds grid token count")
+            # EVS exposes only K retained placeholders before the encoder
+            # supplies exact per-token positions. Advancing by the full grid
+            # here would overlap the next video/text span.
+            llm_pos_ids_list.append(
+                media_positions[:, :placeholder_length] + text_len + st_idx
+            )
+            st = offset + placeholder_length
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -1620,6 +1658,10 @@ class Qwen2_5_VLForConditionalGeneration(
         mm_embeddings_pos = [
             mm[:, -4:].permute(1, 0).long() for mm in multimodal_embeddings
         ]
+        verify_positions = os.getenv("CEDFS_M1_VERIFY_POSITIONS") == "1"
+        if verify_positions:
+            prior_positions = mrope_positions.detach().cpu().contiguous()
+            prior_digest = hashlib.sha256(prior_positions.numpy().tobytes()).hexdigest()
 
         with gpu_sync_allowed():
             positions, mrope_positions_delta = recompute_mrope_positions(
@@ -1630,6 +1672,27 @@ class Qwen2_5_VLForConditionalGeneration(
                 vision_start_token_id,
                 image_token_id,
                 video_token_id,
+            )
+
+        if verify_positions:
+            exact_positions = positions.detach().cpu().contiguous()
+            digest = hashlib.sha256(exact_positions.numpy().tobytes()).hexdigest()
+            media_digests = [
+                hashlib.sha256(
+                    item.detach().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()
+                for item in mm_embeddings_pos
+            ]
+            logger.info(
+                "CedFS M1 M-RoPE exact: input_tokens=%s computed=%s shape=%s "
+                "delta=%s sha256=%s prior_sha256=%s media_sha256=%s",
+                len(input_ids_t),
+                num_computed_tokens,
+                tuple(exact_positions.shape),
+                mrope_positions_delta,
+                digest,
+                prior_digest,
+                media_digests,
             )
 
         return mm_embeddings_out, positions, mrope_positions_delta

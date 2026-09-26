@@ -74,6 +74,7 @@ class DefaultModelState(ModelState):
                 self.model,
                 new_req_data.prefill_token_ids,
                 mm_features=mm_features,
+                req_id=new_req_data.req_id,
             )
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.add_request(req_index, new_req_data)
@@ -81,6 +82,10 @@ class DefaultModelState(ModelState):
     def remove_request(self, req_id: str) -> None:
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
+
+    def finish_request(self, req_id: str) -> None:
+        if self.rope_state is not None:
+            self.rope_state.finish_request(req_id)
 
     def apply_staged_writes(self) -> None:
         if self.rope_state is not None:

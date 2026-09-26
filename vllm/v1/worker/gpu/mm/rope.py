@@ -58,6 +58,13 @@ class RopeState:
 
         # Delta is non-zero for M-RoPE, always 0 for XD-RoPE.
         self.prefill_delta = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+        # A pruned request may be removed and re-added when a prefill chunk is
+        # preempted. Slot-indexed positions are then initialized again, so keep
+        # the corrected positions under the stable request ID until completion.
+        self.corrected_prefill: dict[
+            str, tuple[torch.Tensor, int, tuple[int, ...]]
+        ] = {}
+        self.prefill_token_ids_by_request: dict[str, tuple[int, ...]] = {}
 
     def init_prefill_positions(
         self,
@@ -65,6 +72,7 @@ class RopeState:
         model: nn.Module,
         prefill_token_ids: list[int],
         mm_features: list,
+        req_id: str,
     ) -> None:
         if self.has_delta:
             mrope_model = cast(SupportsMRoPE, model)
@@ -77,6 +85,17 @@ class RopeState:
             prefill_positions = xdrope_model.get_xdrope_input_positions(
                 prefill_token_ids, mm_features
             )
+
+        token_ids = tuple(prefill_token_ids)
+        self.prefill_token_ids_by_request[req_id] = token_ids
+        saved = self.corrected_prefill.get(req_id)
+        if saved is not None:
+            if saved[0].shape == prefill_positions.shape and saved[2] == token_ids:
+                prefill_positions, delta = saved[:2]
+                self.prefill_delta.np[req_idx] = delta
+            else:
+                # A streaming input update changed the prompt layout.
+                self.corrected_prefill.pop(req_id)
 
         for i in range(self.num_dims):
             pos = prefill_positions[i].tolist()
@@ -96,16 +115,25 @@ class RopeState:
         return self.prefill_positions.gpu[base : base + self.num_dims, :length]
 
     def update_prefill_positions(
-        self, req_idx: int, positions: torch.Tensor, delta: int
+        self, req_idx: int, positions: torch.Tensor, delta: int, req_id: str
     ) -> None:
         """Overwrite a request's staged prefill positions with recomputed values."""
         base = self.num_dims * req_idx
         length = positions.shape[1]
         self.prefill_positions.gpu[base : base + self.num_dims, :length].copy_(
-            positions
+            positions.to(dtype=torch.int32)
         )
         if self.has_delta:
             self.prefill_delta.np[req_idx] = delta
+            self.corrected_prefill[req_id] = (
+                positions.to(device="cpu", dtype=torch.int32).clone(),
+                delta,
+                self.prefill_token_ids_by_request[req_id],
+            )
+
+    def finish_request(self, req_id: str) -> None:
+        self.corrected_prefill.pop(req_id, None)
+        self.prefill_token_ids_by_request.pop(req_id, None)
 
     def prepare_positions(
         self,

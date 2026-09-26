@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
+import json
 import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -69,6 +71,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     PlaceholderRange,
 )
+from vllm.multimodal.video_prune.evs import compute_retained_tokens_count
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
@@ -445,8 +448,7 @@ class OpenAIServingChat(GenerateBaseServing):
             mm_token_counts=mm_token_counts,
         )
 
-    @staticmethod
-    def _build_cedfs_native_inputs(request: ChatCompletionRequest):
+    def _build_cedfs_native_inputs(self, request: ChatCompletionRequest):
         features = request.cedfs_mm_features
         token_ids = request.cedfs_prompt_token_ids
         if not features or not token_ids or any(token < 0 for token in token_ids):
@@ -481,6 +483,73 @@ class OpenAIServingChat(GenerateBaseServing):
                 raise ValueError("CedFS native ownership_epoch mismatch")
             if feature.device_key != expected_device:
                 raise ValueError("CedFS native device_key mismatch")
+            if feature.modality == "video":
+                config = self.model_config.hf_config
+                if config.model_type != "qwen2_5_vl":
+                    raise ValueError("CedFS native video currently requires Qwen2.5-VL")
+                mm_config = self.model_config.multimodal_config
+                if mm_config is None or feature.video_pruning_rate is None:
+                    raise ValueError("CedFS native video pruning config is missing")
+                expected_q = float(mm_config.video_pruning_rate or 0.0)
+                if abs(feature.video_pruning_rate - expected_q) > 1e-9:
+                    raise ValueError("CedFS native video pruning rate mismatch")
+                t, h, w = feature.grid_thw
+                merge = config.vision_config.spatial_merge_size
+                if h % merge or w % merge:
+                    raise ValueError("CedFS native video grid is not merge-aligned")
+                tokens_per_frame = (h // merge) * (w // merge)
+                expected_tokens = (
+                    compute_retained_tokens_count(tokens_per_frame, t, expected_q)
+                    if expected_q > 0
+                    else t * tokens_per_frame
+                )
+                expected_width = config.text_config.hidden_size + (
+                    4 if expected_q > 0 else 0
+                )
+                if (
+                    feature.position_length != expected_tokens
+                    or feature.tensor_shape != [expected_tokens, expected_width]
+                ):
+                    raise ValueError("CedFS native video tensor/placeholder mismatch")
+                if feature.version == 2:
+                    revisions = (
+                        os.getenv("CEDFS_MODEL_REVISION", ""),
+                        os.getenv("CEDFS_PROCESSOR_REVISION", ""),
+                        os.getenv("CEDFS_EVS_VERSION", ""),
+                    )
+                    if not all(revisions):
+                        raise ValueError("CedFS v2 revisions are not configured")
+                    semantic = {
+                        "media_sample_id": feature.mm_hash,
+                        "model_revision": revisions[0],
+                        "processor_revision": revisions[1],
+                        "evs_method": "evs",
+                        "evs_version": revisions[2],
+                        "q": format(expected_q, ".12g"),
+                        "grid_thw": feature.grid_thw,
+                        "second_per_grid_ts": format(
+                            feature.second_per_grid_ts, ".12g"
+                        ),
+                        "spatial_merge_size": merge,
+                        "layout_id": "qwen2_5_vl_evs_pos4_v1",
+                    }
+                    digest = lambda value: hashlib.sha256(
+                        json.dumps(
+                            value, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest()
+                    semantic_digest = digest(semantic)
+                    physical_digest = digest(
+                        {
+                            "semantic_variant": semantic_digest,
+                            "codec_id": "evs-" + feature.tensor_dtype,
+                        }
+                    )
+                    if (
+                        feature.semantic_variant != semantic_digest
+                        or feature.physical_variant != physical_digest
+                    ):
+                        raise ValueError("CedFS native video variant mismatch")
             end = feature.position_offset + feature.position_length
             if end > len(token_ids):
                 raise ValueError("CedFS native placeholder exceeds prompt length")
@@ -499,6 +568,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     )
                 }
             )
+            if feature.modality == "video":
+                grid_item["second_per_grid_ts"] = MultiModalFieldElem(
+                    data=torch.tensor(feature.second_per_grid_ts, dtype=torch.float32),
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                )
             mm_kwargs.setdefault(feature.modality, []).append(grid_item)
             mm_placeholders.setdefault(feature.modality, []).append(
                 PlaceholderRange(
@@ -532,9 +606,7 @@ class OpenAIServingChat(GenerateBaseServing):
         if not secret or not owner_pd or not features:
             raise RouteTokenError("CedFS direct-PD token context is not configured")
         scopes = {feature.model_scope for feature in features}
-        fingerprints = {
-            feature.compatibility_fingerprint for feature in features
-        }
+        fingerprints = {feature.compatibility_fingerprint for feature in features}
         epochs = {feature.ownership_epoch for feature in features}
         if len(scopes) != 1 or len(fingerprints) != 1 or len(epochs) != 1:
             raise RouteTokenError(

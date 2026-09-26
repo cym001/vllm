@@ -88,7 +88,9 @@ class MultiModalPruner:
                 mrope_positions=mrope_positions,
                 num_computed_tokens=num_computed,
             )
-            self.rope_state.update_prefill_positions(req_idx, new_positions, delta)
+            self.rope_state.update_prefill_positions(
+                req_idx, new_positions, delta, req_id
+            )
             cleaned.extend(
                 copy_mm_embedding_modality(src, dst)
                 for src, dst in zip(req_embeds, req_cleaned)

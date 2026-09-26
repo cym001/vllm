@@ -238,6 +238,9 @@ def recompute_mrope_positions(
     for mm_pos in multimodal_positions:
         # Each mm_pos can be a complete embedding for single media
         # or it can be a part of a single media (due to chunked prefill)
+        # Re-evaluate this after each media item: one prefill chunk may hold
+        # multiple videos with text between them.
+        seen_mm_tokens = torch.count_nonzero(media_mask[:num_computed_tokens])
 
         # Cases to cover
         # - Current prefill chunk has no vision start indexes at all
@@ -274,6 +277,26 @@ def recompute_mrope_positions(
             in_the_middle_of_media = (
                 seen_mm_tokens > seem_mm_tokens_before_last_vision_start
             )
+            # An external encoder cache may defer prefill immediately after
+            # VISION_START, before the first media placeholder is computed.
+            # In that case the media counts are equal even though this is
+            # still the current media segment.
+            if not in_the_middle_of_media:
+                next_media_indices = media_mask[num_computed_tokens:].nonzero(
+                    as_tuple=True
+                )[0]
+                next_vision_start_indices = vision_start_indices[
+                    vision_start_indices >= num_computed_tokens
+                ]
+                if len(next_media_indices):
+                    next_media_token = num_computed_tokens + next_media_indices[0]
+                    in_the_middle_of_media = (
+                        next_media_token > last_vision_start_token
+                        and (
+                            not len(next_vision_start_indices)
+                            or next_media_token < next_vision_start_indices[0]
+                        )
+                    )
             # For Qwen3 VL, we can be inside a media segment even before any
             # video tokens appear (timestamp tokens are text). If we've passed
             # the last vision_start token but haven't reached the first video
@@ -350,7 +373,10 @@ def recompute_mrope_positions(
         positions[:, local_end:N] = text_pos_sum + offset - 1
 
         # Include distance to the next vision start token
-        num_computed_tokens += mm_pos.shape[1]
+        next_media = media_mask[local_end:].nonzero(as_tuple=True)[0]
+        num_computed_tokens = (
+            local_end + int(next_media[0]) if len(next_media) else local_end
+        )
 
     mrope_positions_delta = (positions.max() + 1 - N).item()
     return positions, mrope_positions_delta

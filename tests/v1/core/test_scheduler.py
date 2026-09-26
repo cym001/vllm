@@ -13,6 +13,7 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    MultiModalConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -121,6 +122,35 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+@pytest.mark.parametrize(
+    ("pruning_rate", "modality", "skip_prefix"),
+    [(0.5, "video", True), (0.0, "video", False), (0.5, "image", False)],
+)
+def test_evs_video_recomputes_mrope_instead_of_reusing_prefix(
+    pruning_rate: float, modality: str, skip_prefix: bool
+) -> None:
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.vllm_config.model_config.multimodal_config = MultiModalConfig(
+        video_pruning_rate=pruning_rate
+    )
+    request = create_requests(num_requests=1)[0]
+    request.mm_features = [
+        MultiModalFeatureSpec(
+            data=MultiModalKwargsItem.dummy(),
+            modality=modality,
+            identifier="media",
+            mm_position=PlaceholderRange(offset=0, length=1),
+        )
+    ]
+
+    scheduler.add_request(request)
+
+    assert request.skip_reading_prefix_cache is skip_prefix
+    assert scheduler.kv_cache_manager.prefix_cache_lookup_enabled(request) is (
+        not skip_prefix
+    )
 
 
 def test_finish_request():
@@ -4145,20 +4175,16 @@ def test_strict_ec_pending_does_not_block_later_ready_request():
         scheduler.add_request(request)
     output = scheduler.schedule()
 
-    assert [req.req_id for req in output.scheduled_new_reqs] == [
-        requests[1].request_id
-    ]
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[1].request_id]
     assert requests[0].request_id not in output.num_scheduled_tokens
     assert requests[0].status == RequestStatus.WAITING
 
     availability["pending_hash"] = ECCacheAvailability.READY
     output = scheduler.schedule()
-    assert [req.req_id for req in output.scheduled_new_reqs] == [
-        requests[0].request_id
-    ]
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
 
 
-def test_strict_ec_failed_never_falls_back_to_local_encoder():
+def test_strict_ec_failed_finishes_request_without_local_encoder():
     scheduler = create_scheduler(
         model="llava-hf/llava-1.5-7b-hf",
         enable_prefix_caching=True,
@@ -4182,6 +4208,19 @@ def test_strict_ec_failed_never_falls_back_to_local_encoder():
     assert output.total_num_scheduled_tokens == 0
     assert output.scheduled_encoder_inputs == {}
     assert request.status == RequestStatus.WAITING
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(output, model_output)
+    failure = outputs[request.client_index].outputs[0]
+    assert failure.finish_reason == FinishReason.ERROR
+    assert failure.stop_reason == "cedfs_ec_unavailable: failed_hash"
+    assert request.status == RequestStatus.FINISHED_ERROR
 
 
 def test_strict_ec_async_load_uses_transfer_only_step_before_prefill():
@@ -4255,9 +4294,7 @@ def test_strict_ec_async_load_failure_finishes_request():
         prompt_logprobs_dict={},
         pooler_output=[],
         ec_connector_output=ECConnectorOutput(
-            failed_recving={
-                "failed_async_hash": "ValueError: checksum mismatch"
-            }
+            failed_recving={"failed_async_hash": "ValueError: checksum mismatch"}
         ),
     )
     outputs = scheduler.update_from_output(transfer_output, model_output)

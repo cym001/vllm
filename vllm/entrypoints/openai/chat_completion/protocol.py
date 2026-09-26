@@ -3,6 +3,7 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import math
 import time
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -210,7 +211,7 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
 
 
 class CedfsMMFeatureParam(OpenAIBaseModel):
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     mm_hash: str = Field(min_length=1)
     model_scope: str = Field(min_length=1)
     num_encoder_tokens: int = Field(gt=0)
@@ -223,9 +224,23 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
     position_offset: int = Field(ge=0)
     position_length: int = Field(gt=0)
     grid_thw: list[int] = Field(min_length=3, max_length=3)
+    second_per_grid_ts: float | None = None
+    video_pruning_rate: float | None = None
+    semantic_variant: str | None = None
+    physical_variant: str | None = None
 
     @model_validator(mode="after")
     def _validate_native_shape_and_position(self):
+        if self.version == 2 and (
+            self.modality != "video"
+            or any(
+                value is None
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in (self.semantic_variant, self.physical_variant)
+            )
+        ):
+            raise ValueError("v2 video feature requires variant digests")
         if any(dimension <= 0 for dimension in self.tensor_shape):
             raise ValueError("tensor_shape dimensions must be positive")
         if self.position_length != self.num_encoder_tokens:
@@ -234,6 +249,24 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
             raise ValueError("grid_thw dimensions must be positive")
         if self.modality == "image" and self.grid_thw[0] != 1:
             raise ValueError("image grid_thw temporal dimension must equal 1")
+        if self.modality == "video":
+            if (
+                self.second_per_grid_ts is None
+                or not math.isfinite(self.second_per_grid_ts)
+                or self.second_per_grid_ts <= 0
+            ):
+                raise ValueError("video second_per_grid_ts must be positive")
+            if (
+                self.video_pruning_rate is None
+                or not math.isfinite(self.video_pruning_rate)
+                or not 0 <= self.video_pruning_rate < 1
+            ):
+                raise ValueError("video_pruning_rate must be in [0,1)")
+            if (
+                len(self.tensor_shape) != 2
+                or self.tensor_shape[0] != self.num_encoder_tokens
+            ):
+                raise ValueError("video tensor rows must equal num_encoder_tokens")
         return self
 
 

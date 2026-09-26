@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.multimodal.video_prune.evs import recompute_mrope_positions
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -30,6 +31,51 @@ IMAGE_TOKEN_ID = 999
 VIDEO_TOKEN_ID = 888
 VISION_START_TOKEN_ID = 777
 VISION_END_TOKEN_ID = 778
+
+
+@pytest.mark.parametrize(
+    ("input_ids", "num_computed_tokens"),
+    [
+        ([11, VISION_START_TOKEN_ID, VIDEO_TOKEN_ID, 12], 2),
+        (
+            [
+                11,
+                VISION_START_TOKEN_ID,
+                VIDEO_TOKEN_ID,
+                12,
+                VISION_START_TOKEN_ID,
+                VIDEO_TOKEN_ID,
+                13,
+            ],
+            5,
+        ),
+    ],
+)
+def test_mrope_deferred_after_vision_start(
+    input_ids: list[int], num_computed_tokens: int
+) -> None:
+    """A deferred cache load can stop prefill after the vision start token."""
+    token_ids = torch.tensor(input_ids)
+    positions = torch.arange(len(input_ids)).repeat(3, 1)
+    media_positions = torch.tensor([[2], [3], [4], [5]])
+
+    actual, actual_delta = recompute_mrope_positions(
+        token_ids,
+        [media_positions],
+        positions,
+        num_computed_tokens,
+        VISION_START_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        VIDEO_TOKEN_ID,
+    )
+
+    vision_start = num_computed_tokens - 1
+    base = positions[-1, vision_start] + 1
+    expected = positions.clone()
+    expected[:, num_computed_tokens] = media_positions[:3, 0] + base
+    expected[:, num_computed_tokens + 1 :] = base + media_positions[3, 0]
+    assert torch.equal(actual, expected)
+    assert actual_delta == expected.max().item() + 1 - len(input_ids)
 
 
 @dataclass
