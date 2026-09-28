@@ -211,7 +211,7 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
 
 
 class CedfsMMFeatureParam(OpenAIBaseModel):
-    version: Literal[1, 2] = 1
+    version: Literal[1, 2, 3] = 1
     mm_hash: str = Field(min_length=1)
     model_scope: str = Field(min_length=1)
     num_encoder_tokens: int = Field(gt=0)
@@ -228,6 +228,7 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
     video_pruning_rate: float | None = None
     semantic_variant: str | None = None
     physical_variant: str | None = None
+    variant_context: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _validate_native_shape_and_position(self):
@@ -241,6 +242,12 @@ class CedfsMMFeatureParam(OpenAIBaseModel):
             )
         ):
             raise ValueError("v2 video feature requires variant digests")
+        if self.version == 3 and (
+            self.modality != "video"
+            or self.variant_context is None
+            or self.mm_hash != self.physical_variant
+        ):
+            raise ValueError("M2 video feature requires a physical-key context")
         if any(dimension <= 0 for dimension in self.tensor_shape):
             raise ValueError("tensor_shape dimensions must be positive")
         if self.position_length != self.num_encoder_tokens:

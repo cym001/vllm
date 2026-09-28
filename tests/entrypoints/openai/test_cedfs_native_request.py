@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
 from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
+from cedfs_ec.variant import MediaSample
 from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -54,6 +57,102 @@ def _build(request, q=0.0):
         )
     )
     return OpenAIServingChat._build_cedfs_native_inputs(server, request)
+
+
+def test_m2_producer_rejects_source_not_in_request():
+    body = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "file:///video-a.mp4"},
+                        "uuid": "sample-a",
+                    },
+                ],
+            }
+        ],
+        "media_io_kwargs": {"video": {"fps": 0.5}},
+        "ec_transfer_params": {
+            "m2_samples": {"sample-a": {"content_sha256": "placeholder"}},
+            "m2_sample_sources": {"sample-a": "file:///video-a.mp4"},
+        },
+    }
+    request = ChatCompletionRequest.model_validate(body)
+    OpenAIServingChat._validate_cedfs_m2_sample_sources(request)
+    request.ec_transfer_params["m2_sample_sources"]["sample-a"] = (
+        "file:///different-video.mp4"
+    )
+    with pytest.raises(ValueError, match="does not match request video"):
+        OpenAIServingChat._validate_cedfs_m2_sample_sources(request)
+
+
+def test_m2_producer_rejects_altered_frames_before_scheduler(monkeypatch):
+    sample = MediaSample.from_records(
+        "a" * 64,
+        {
+            "frame_indices": [0],
+            "frame_timestamps": ["0"],
+            "sampled_rgb_sha256": "b" * 64,
+        },
+        {
+            "processor_revision": "revision",
+            "preprocessor_config_sha256": "c" * 64,
+            "target_fps": "0.5",
+        },
+    )
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "file:///video.mp4"},
+                            "uuid": sample.digest,
+                        },
+                    ],
+                }
+            ],
+            "media_io_kwargs": {"video": {"fps": 0.5}},
+            "ec_transfer_params": {
+                "m2_samples": {sample.digest: asdict(sample)},
+                "m2_sample_sources": {sample.digest: "file:///video.mp4"},
+            },
+        }
+    )
+    extra = {
+        "evs_m2": True,
+        "processor_revision": "revision",
+        "m2_preprocessor_config_sha256": "c" * 64,
+        "m2_video_fps": "0.5",
+    }
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    get_from_extra_config=lambda key, default: extra.get(key, default)
+                )
+            )
+        )
+    )
+    monkeypatch.setattr(
+        "cedfs_ec.m2_sampling.sample_m2_video_source", lambda *args, **kwargs: sample
+    )
+    asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
+    monkeypatch.setattr(
+        "cedfs_ec.m2_sampling.sample_m2_video_source",
+        lambda *args, **kwargs: replace(sample, content_sha256="d" * 64),
+    )
+    with pytest.raises(ValueError, match="sampled different video frames"):
+        asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
+    extra["m2_preprocessor_config_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="Processor sampling configuration differs"):
+        asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
 
 
 @pytest.fixture(autouse=True)
@@ -203,6 +302,72 @@ def test_native_video_v2_checks_frozen_variant(monkeypatch):
     # though the row count and frozen revisions agree.
     with pytest.raises(ValueError, match="variant mismatch"):
         _build(_request([feature]), q=0.5)
+
+
+def test_native_m2_video_passes_frozen_context_to_scheduler(monkeypatch):
+    import hashlib
+
+    from cedfs_ec.variant import MediaSample, build_video_context, context_to_dict
+
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    sample = MediaSample.from_records(
+        digest("media"),
+        {
+            "frame_indices": [0, 1],
+            "frame_timestamps": ["0", "0.5"],
+            "sampled_rgb_sha256": digest("frames"),
+        },
+        {"processor_revision": "processor-a"},
+    )
+    context = build_video_context(
+        mm_hash="placeholder",
+        sample=sample,
+        model_revision="weights-a",
+        processor_revision="processor-a",
+        evs_version="evs-a",
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        spatial_merge_size=2,
+        codec_id="evs-raw-bf16",
+        calibration_sha256=digest("config"),
+        original_dtype="bfloat16",
+    )
+    context = build_video_context(
+        mm_hash=context.storage_key,
+        sample=sample,
+        model_revision="weights-a",
+        processor_revision="processor-a",
+        evs_version="evs-a",
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        spatial_merge_size=2,
+        codec_id="evs-raw-bf16",
+        calibration_sha256=digest("config"),
+        original_dtype="bfloat16",
+    )
+    monkeypatch.setenv("CEDFS_MODEL_REVISION", "weights-a")
+    monkeypatch.setenv("CEDFS_PROCESSOR_REVISION", "processor-a")
+    monkeypatch.setenv("CEDFS_EVS_VERSION", "evs-a")
+    feature = _feature(
+        version=3,
+        mm_hash=context.storage_key,
+        modality="video",
+        num_encoder_tokens=4,
+        tensor_shape=[4, 2052],
+        position_length=4,
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        video_pruning_rate=0.5,
+        semantic_variant=context.semantic.digest,
+        physical_variant=context.storage_key,
+        variant_context=context_to_dict(context),
+    )
+    request = _request([feature])
+    _conversation, inputs = _build(request, q=0.5)
+    assert inputs[0]["mm_hashes"] == {"video": [context.storage_key]}
+    assert request.ec_transfer_params["m2_contexts"][
+        context.storage_key
+    ] == context_to_dict(context)
 
 
 def test_direct_pd_route_token_is_required_and_bound(monkeypatch):

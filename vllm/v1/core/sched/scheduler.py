@@ -935,17 +935,24 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
-                    # Skip request with pending mm encoding prefetches
-                    if (
-                        self.ec_connector is not None
-                        and request.mm_features
-                        and not self.ec_connector.ensure_cache_available(
-                            request, num_computed_tokens
-                        )
-                    ):
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
+                    # Skip requests with pending MM prefetches. A malformed
+                    # external EC identity must fail only this request, not
+                    # terminate the engine process.
+                    if self.ec_connector is not None and request.mm_features:
+                        try:
+                            ec_available = self.ec_connector.ensure_cache_available(
+                                request, num_computed_tokens
+                            )
+                        except (OSError, KeyError, TypeError, ValueError) as exc:
+                            request.stop_reason = f"cedfs_ec_variant_invalid: {exc}"
+                            self.failed_ec_availability_reqs.add(request.request_id)
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        if not ec_available:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats and request.num_preemptions <= 0:

@@ -6002,6 +6002,37 @@ def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
     _assert_right_encoder_inputs(output, expected_total_reqs=0)
 
 
+def test_ec_connector_invalid_variant_fails_only_its_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    invalid = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+        req_ids=["invalid-variant"],
+    )[0]
+    behind = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        req_ids=["valid-text"],
+    )[0]
+    scheduler.ec_connector.ensure_cache_available = Mock(
+        side_effect=ValueError("sample mismatch")
+    )
+    scheduler.add_request(invalid)
+    scheduler.add_request(behind)
+
+    output = scheduler.schedule()
+
+    assert invalid.request_id not in output.num_scheduled_tokens
+    assert behind.request_id in output.num_scheduled_tokens
+    assert invalid.request_id in scheduler.failed_ec_availability_reqs
+    assert invalid.stop_reason == "cedfs_ec_variant_invalid: sample mismatch"
+
+
 def test_ec_connector_pending_prefetch_only_checks_future_mm_features():
     """Test that future mm feature filtering only yields features beyond
     the computed token frontier.
