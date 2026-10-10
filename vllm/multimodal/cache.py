@@ -598,11 +598,14 @@ class BaseMultiModalReceiverCache(
         Uses mm_hash for cache key to share across LoRAs (falls back to
         identifier for backward compatibility).
         """
-        for feature in mm_features:
+        cache_features = [
+            feature for feature in mm_features if not feature.external_cache_only
+        ]
+        for feature in cache_features:
             cache_key = feature.mm_hash or feature.identifier
             self.touch_receiver_cache_item(cache_key, feature.data)
 
-        for feature in mm_features:
+        for feature in cache_features:
             cache_key = feature.mm_hash or feature.identifier
             feature.data = self.get_and_update_item(feature.data, cache_key)
         return mm_features

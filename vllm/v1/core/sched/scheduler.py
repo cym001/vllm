@@ -7,9 +7,12 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
+from vllm.cedfs_trace import log_cedfs_ttft_event
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECCacheAvailability,
     ECConnectorBase,
     ECConnectorMetadata,
     ECConnectorRole,
@@ -205,10 +208,15 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.pending_ec_loads: dict[str, set[str]] = {}
+        self._cedfs_trace_scheduled_requests: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
+        # Strict external EC failures are request-level terminal errors, not
+        # permanently blocked prefills.
+        self.failed_ec_availability_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -534,6 +542,8 @@ class Scheduler(SchedulerInterface):
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
+            async_load_encoder_input: list[int] = []
+            external_cache_blocked = False
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
                 (
@@ -541,6 +551,8 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens,
                     new_encoder_compute_budget,
                     external_load_encoder_input,
+                    external_cache_blocked,
+                    async_load_encoder_input,
                 ) = self._try_schedule_encoder_inputs(
                     request,
                     request.num_computed_tokens,
@@ -553,6 +565,19 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            if async_load_encoder_input and num_new_tokens == 0:
+                required_hashes = set()
+                for i in async_load_encoder_input:
+                    assert self.ec_connector is not None
+                    self.ec_connector.update_state_for_async_load(request, i)
+                    required_hashes.add(request.mm_features[i].identifier)
+                self.pending_ec_loads[request.request_id] = required_hashes
+                log_cedfs_ttft_event(logger, request.request_id, "ec_wait_start")
+                self.running.pop(req_index)
+                request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
+                self.skipped_waiting.add_request(request)
+                continue
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -831,17 +856,24 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
-                    # Skip request with pending mm encoding prefetches
-                    if (
-                        self.ec_connector is not None
-                        and request.mm_features
-                        and not self.ec_connector.ensure_cache_available(
-                            request, num_computed_tokens
-                        )
-                    ):
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
+                    # Skip requests with pending MM prefetches. A malformed
+                    # external EC identity must fail only this request, not
+                    # terminate the engine process.
+                    if self.ec_connector is not None and request.mm_features:
+                        try:
+                            ec_available = self.ec_connector.ensure_cache_available(
+                                request, num_computed_tokens
+                            )
+                        except (OSError, KeyError, TypeError, ValueError) as exc:
+                            request.stop_reason = f"cedfs_ec_variant_invalid: {exc}"
+                            self.failed_ec_availability_reqs.add(request.request_id)
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        if not ec_available:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats and request.num_preemptions <= 0:
@@ -860,6 +892,8 @@ class Scheduler(SchedulerInterface):
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
+                async_load_encoder_input = []
+                external_cache_blocked = False
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
 
@@ -920,6 +954,8 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             new_encoder_compute_budget,
                             external_load_encoder_input,
+                            external_cache_blocked,
+                            async_load_encoder_input,
                         ) = self._try_schedule_encoder_inputs(
                             request,
                             num_computed_tokens,
@@ -929,6 +965,27 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if async_load_encoder_input:
+                                request = request_queue.pop_request()
+                                required_hashes = set()
+                                for i in async_load_encoder_input:
+                                    assert self.ec_connector is not None
+                                    self.ec_connector.update_state_for_async_load(
+                                        request, i
+                                    )
+                                    required_hashes.add(
+                                        request.mm_features[i].identifier
+                                    )
+                                self.pending_ec_loads[request.request_id] = (
+                                    required_hashes
+                                )
+                                request.status = RequestStatus.WAITING_FOR_REMOTE_ECS
+                                step_skipped_waiting.prepend_request(request)
+                                continue
+                            if external_cache_blocked:
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -1059,6 +1116,11 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if request.request_id not in self._cedfs_trace_scheduled_requests:
+                        self._cedfs_trace_scheduled_requests.add(request.request_id)
+                        log_cedfs_ttft_event(
+                            logger, request.request_id, "engine_scheduled"
+                        )
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -1473,7 +1535,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], bool, list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
@@ -1495,12 +1557,14 @@ class Scheduler(SchedulerInterface):
         blocks and externally cached blocks (via KVConnector).
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
-            return [], num_new_tokens, encoder_compute_budget, []
+            return [], num_new_tokens, encoder_compute_budget, [], False, []
         encoder_inputs_to_schedule: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
         assert len(mm_features) > 0
         external_load_encoder_input = []
+        async_load_encoder_input = []
+        external_cache_blocked = False
 
         # NOTE: since scheduler operates on the request level (possibly with
         # multiple encoder inputs per request), we need to create temporary
@@ -1548,9 +1612,20 @@ class Scheduler(SchedulerInterface):
                     # current step.
                     continue
 
+                already_recorded = i in self.encoder_cache_manager.get_cached_input_ids(
+                    request
+                )
                 if self.encoder_cache_manager.check_and_update_cache(request, i):
                     # The encoder input is already computed and cached from a
                     # previous step.
+                    if envs.CEDFS_TRACE and not already_recorded:
+                        logger.info(
+                            "CedFS EC local cache hit: request_id=%s "
+                            "mm_hash=%s input_id=%d source=encoder_cache",
+                            request.request_id,
+                            item_identifier,
+                            i,
+                        )
                     continue
 
             # If no encoder input chunking is allowed, we do not want to
@@ -1606,13 +1681,52 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
-            ):
-                mm_hashes_to_schedule.add(item_identifier)
-                external_load_encoder_input.append(i)
-                num_embeds_to_schedule += num_encoder_embeds
-                continue
+            if self.ec_connector is not None:
+                availability = self.ec_connector.get_cache_availability(item_identifier)
+                if (
+                    self.ec_connector.requires_external_cache()
+                    and availability == ECCacheAvailability.FAILED
+                ):
+                    request.stop_reason = f"cedfs_ec_unavailable: {item_identifier}"
+                    self.failed_ec_availability_reqs.add(request.request_id)
+                    num_new_tokens = 0
+                    external_cache_blocked = True
+                    break
+                if availability == ECCacheAvailability.READY:
+                    if (
+                        self.ec_connector.supports_async_load()
+                        and not self.ec_connector.is_async_load_finished(
+                            item_identifier
+                        )
+                    ):
+                        if num_computed_tokens + shift_computed_tokens < start_pos:
+                            num_new_tokens = start_pos - (
+                                num_computed_tokens + shift_computed_tokens
+                            )
+                        else:
+                            num_new_tokens = 0
+                        external_cache_blocked = True
+                        async_load_encoder_input.append(i)
+                        break
+                    mm_hashes_to_schedule.add(item_identifier)
+                    external_load_encoder_input.append(i)
+                    num_embeds_to_schedule += num_encoder_embeds
+                    continue
+                # A strict consumer must never execute the encoder locally.
+                # PENDING may become READY. FAILED is handled above as a
+                # terminal request error; neither may run the encoder locally.
+                if (
+                    self.ec_connector.requires_external_cache()
+                    and availability == ECCacheAvailability.PENDING
+                ):
+                    if num_computed_tokens + shift_computed_tokens < start_pos:
+                        num_new_tokens = start_pos - (
+                            num_computed_tokens + shift_computed_tokens
+                        )
+                    else:
+                        num_new_tokens = 0
+                    external_cache_blocked = True
+                    break
 
             num_embeds_to_schedule += num_encoder_embeds
             encoder_compute_budget -= num_encoder_embeds
@@ -1624,6 +1738,8 @@ class Scheduler(SchedulerInterface):
             num_new_tokens,
             encoder_compute_budget,
             external_load_encoder_input,
+            external_cache_blocked,
+            async_load_encoder_input,
         )
 
     def _make_scheduled_encoder_input_stats(
@@ -1679,7 +1795,11 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        if self.ec_connector is not None and ec_connector_output is not None:
+            self.ec_connector.update_connector_output(ec_connector_output)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1702,6 +1822,35 @@ class Scheduler(SchedulerInterface):
             failed_kv_load_req_ids = self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
+            )
+        failed_ec_requests: list[Request] = []
+        if ec_connector_output and ec_connector_output.failed_recving:
+            failed_hashes = set(ec_connector_output.failed_recving)
+            failed_ec_requests = [
+                request
+                for req_id, required_hashes in self.pending_ec_loads.items()
+                if required_hashes & failed_hashes
+                and (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+            ]
+            for request in failed_ec_requests:
+                request_failures = {
+                    mm_hash: ec_connector_output.failed_recving[mm_hash]
+                    for mm_hash in self.pending_ec_loads.get(request.request_id, ())
+                    if mm_hash in ec_connector_output.failed_recving
+                }
+                request.stop_reason = "cedfs_ec_load_failed: " + "; ".join(
+                    f"{mm_hash}={reason}"
+                    for mm_hash, reason in sorted(request_failures.items())
+                )
+                logger.error(
+                    "Failing request %s due to EC load failure: %s",
+                    request.request_id,
+                    request_failures,
+                )
+            self.finish_requests(
+                (request.request_id for request in failed_ec_requests),
+                RequestStatus.FINISHED_ERROR,
             )
 
         # Persist per-step routed experts into the scheduler-side slot
@@ -1953,6 +2102,11 @@ class Scheduler(SchedulerInterface):
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
+        failed_ec_availability_reqs: set[str] = getattr(
+            self, "failed_ec_availability_reqs", set()
+        )
+        error_req_ids.update(failed_ec_availability_reqs)
+        failed_ec_availability_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
 
@@ -1966,10 +2120,22 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=request.stop_reason,
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )
                 )
+        for request in failed_ec_requests:
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -2052,6 +2218,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_REMOTE_ECS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -2227,6 +2394,16 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            multimodal_config = self.vllm_config.model_config.multimodal_config
+            if (
+                multimodal_config is not None
+                and multimodal_config.get_video_pruning_spec() is not None
+                and request.mm_features
+                and any(feature.modality == "video" for feature in request.mm_features)
+            ):
+                # The cached KV blocks do not carry the M-RoPE delta derived
+                # from the pruned EC. Recompute it from EC on each request.
+                request.skip_reading_prefix_cache = True
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -2284,6 +2461,8 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            self.pending_ec_loads.pop(request.request_id, None)
+            self._cedfs_trace_scheduled_requests.discard(request.request_id)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2686,6 +2865,23 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            if request.num_preemptions:
+                request.status = RequestStatus.PREEMPTED
+            else:
+                request.status = RequestStatus.WAITING
+            return True
+
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_ECS:
+            assert self.ec_connector is not None
+            required_hashes = self.pending_ec_loads.get(request.request_id, set())
+            if not all(
+                self.ec_connector.is_async_load_finished(mm_hash)
+                for mm_hash in required_hashes
+            ):
+                return False
+            self.pending_ec_loads.pop(request.request_id, None)
+            log_cedfs_ttft_event(logger, request.request_id, "ec_ready")
+            log_cedfs_ttft_event(logger, request.request_id, "encoder_cache_attached")
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:

@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
 import io
+import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -11,8 +14,11 @@ from typing import Any, Final, cast
 
 import numpy as np
 import pybase64 as base64
+import torch
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
 from fastapi import Request
 
+from vllm.cedfs_trace import get_cedfs_request_id, log_cedfs_ttft_event
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -54,9 +60,17 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
-from vllm.inputs import EngineInput, MultiModalPlaceholders
+from vllm.inputs import EngineInput, MultiModalPlaceholders, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    MultiModalKwargsItems,
+    PlaceholderRange,
+)
+from vllm.multimodal.video_prune.evs import compute_retained_tokens_count
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
@@ -237,6 +251,29 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        cedfs_request_id = get_cedfs_request_id(
+            raw_request.headers if raw_request is not None else None
+        )
+        request_id = cedfs_request_id or (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        log_cedfs_ttft_event(logger, request_id, "api_receive")
+        # FastAPI/Pydantic has validated the JSON body before this handler.
+        log_cedfs_ttft_event(logger, request_id, "pd_api_parsed")
+        if request.cedfs_mm_features is not None:
+            try:
+                self._validate_cedfs_route_token(
+                    request, raw_request.headers if raw_request is not None else {}
+                )
+            except (RouteTokenError, ValueError) as exc:
+                return self.create_error_response(str(exc))
+        elif (request.ec_transfer_params or {}).get("m2_samples") is not None:
+            try:
+                self._validate_cedfs_m2_sample_sources(request)
+                await self._verify_cedfs_m2_sample_records(request)
+            except (OSError, ImportError, KeyError, TypeError, ValueError) as exc:
+                return self.create_error_response(str(exc))
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -249,15 +286,18 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
-        result = await self.render_chat_request(request)
-        if isinstance(result, ErrorResponse):
-            return result
-
-        conversation, engine_inputs = result
-
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
+        if request.cedfs_mm_features is not None:
+            try:
+                conversation, engine_inputs = self._build_cedfs_native_inputs(request)
+            except ValueError as exc:
+                return self.create_error_response(str(exc))
+        else:
+            result = await self.render_chat_request(request)
+            if isinstance(result, ErrorResponse):
+                return result
+            conversation, engine_inputs = result
+            log_cedfs_ttft_event(logger, request_id, "mm_processor_done")
+        log_cedfs_ttft_event(logger, request_id, "api_request_built")
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -384,6 +424,300 @@ class OpenAIServingChat(GenerateBaseServing):
             request_metadata,
             parser=parser,
             mm_token_counts=mm_token_counts,
+        )
+
+    def _build_cedfs_native_inputs(self, request: ChatCompletionRequest):
+        features = request.cedfs_mm_features
+        token_ids = request.cedfs_prompt_token_ids
+        if not features or not token_ids or any(token < 0 for token in token_ids):
+            raise ValueError(
+                "CedFS native request requires valid prompt tokens and features"
+            )
+
+        expected_scopes = {
+            scope for scope in os.getenv("CEDFS_MODEL_SCOPES", "").split(",") if scope
+        }
+        expected_fingerprint = os.getenv("CEDFS_COMPATIBILITY_FINGERPRINT", "")
+        expected_epoch = os.getenv("CEDFS_OWNERSHIP_EPOCH", "")
+        expected_device = os.getenv("CEDFS_DEVICE_KEY", "")
+        if not (
+            expected_scopes
+            and expected_fingerprint
+            and expected_epoch
+            and expected_device
+        ):
+            raise ValueError("CedFS native PD compatibility context is not configured")
+
+        mm_hashes: dict[str, list[str]] = {}
+        mm_kwargs: dict[str, list[MultiModalKwargsItem]] = {}
+        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
+        spans: list[tuple[int, int]] = []
+        m2_contexts: dict[str, dict[str, Any]] = {}
+        for feature in features:
+            if feature.model_scope not in expected_scopes:
+                raise ValueError("CedFS native model_scope mismatch")
+            if feature.compatibility_fingerprint != expected_fingerprint:
+                raise ValueError("CedFS native compatibility_fingerprint mismatch")
+            if str(feature.ownership_epoch) != expected_epoch:
+                raise ValueError("CedFS native ownership_epoch mismatch")
+            if feature.device_key != expected_device:
+                raise ValueError("CedFS native device_key mismatch")
+            if feature.modality == "video":
+                config = self.model_config.hf_config
+                if config.model_type != "qwen2_5_vl":
+                    raise ValueError("CedFS native video currently requires Qwen2.5-VL")
+                mm_config = self.model_config.multimodal_config
+                if mm_config is None or feature.video_pruning_rate is None:
+                    raise ValueError("CedFS native video pruning config is missing")
+                expected_q = float(mm_config.video_pruning_rate or 0.0)
+                if abs(feature.video_pruning_rate - expected_q) > 1e-9:
+                    raise ValueError("CedFS native video pruning rate mismatch")
+                t, h, w = feature.grid_thw
+                merge = config.vision_config.spatial_merge_size
+                if h % merge or w % merge:
+                    raise ValueError("CedFS native video grid is not merge-aligned")
+                tokens_per_frame = (h // merge) * (w // merge)
+                expected_tokens = (
+                    compute_retained_tokens_count(tokens_per_frame, t, expected_q)
+                    if expected_q > 0
+                    else t * tokens_per_frame
+                )
+                expected_width = config.text_config.hidden_size + (
+                    4 if expected_q > 0 else 0
+                )
+                if (
+                    feature.position_length != expected_tokens
+                    or feature.tensor_shape != [expected_tokens, expected_width]
+                ):
+                    raise ValueError("CedFS native video tensor/placeholder mismatch")
+                if feature.version == 2:
+                    revisions = (
+                        os.getenv("CEDFS_MODEL_REVISION", ""),
+                        os.getenv("CEDFS_PROCESSOR_REVISION", ""),
+                        os.getenv("CEDFS_EVS_VERSION", ""),
+                    )
+                    if not all(revisions):
+                        raise ValueError("CedFS v2 revisions are not configured")
+                    semantic = {
+                        "media_sample_id": feature.mm_hash,
+                        "model_revision": revisions[0],
+                        "processor_revision": revisions[1],
+                        "evs_method": "evs",
+                        "evs_version": revisions[2],
+                        "q": format(expected_q, ".12g"),
+                        "grid_thw": feature.grid_thw,
+                        "second_per_grid_ts": format(
+                            feature.second_per_grid_ts, ".12g"
+                        ),
+                        "spatial_merge_size": merge,
+                        "layout_id": "qwen2_5_vl_evs_pos4_v1",
+                    }
+                    digest = lambda value: hashlib.sha256(
+                        json.dumps(
+                            value, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest()
+                    semantic_digest = digest(semantic)
+                    physical_digest = digest(
+                        {
+                            "semantic_variant": semantic_digest,
+                            "codec_id": "evs-" + feature.tensor_dtype,
+                        }
+                    )
+                    if (
+                        feature.semantic_variant != semantic_digest
+                        or feature.physical_variant != physical_digest
+                    ):
+                        raise ValueError("CedFS native video variant mismatch")
+                elif feature.version == 3:
+                    from cedfs_ec.variant import context_from_dict, decimal_string
+
+                    variant_context = feature.variant_context
+                    if variant_context is None:
+                        raise ValueError("CedFS M2 video variant context is missing")
+                    context = context_from_dict(variant_context)
+                    revisions = (
+                        os.getenv("CEDFS_MODEL_REVISION", ""),
+                        os.getenv("CEDFS_PROCESSOR_REVISION", ""),
+                        os.getenv("CEDFS_EVS_VERSION", ""),
+                    )
+                    if (
+                        not all(revisions)
+                        or (
+                            context.semantic.model_revision,
+                            context.semantic.processor_revision,
+                            context.semantic.evs_version,
+                        )
+                        != revisions
+                    ):
+                        raise ValueError("CedFS M2 video revisions mismatch")
+                    if (
+                        context.mm_hash != feature.mm_hash
+                        or context.storage_key != feature.mm_hash
+                        or context.semantic.digest != feature.semantic_variant
+                        or tuple(feature.grid_thw) != context.semantic.grid_thw
+                        or decimal_string(feature.second_per_grid_ts)
+                        != context.semantic.second_per_grid_ts
+                        or context.semantic.spatial_merge_size != merge
+                        or context.physical.original_dtype != feature.tensor_dtype
+                    ):
+                        raise ValueError("CedFS M2 video variant mismatch")
+                    if context.physical.codec_id == "evs-int8" and (
+                        os.getenv("CEDFS_M2_ALLOW_EXPERIMENTAL_INT8", "0")
+                        not in ("1", "true")
+                    ):
+                        raise ValueError("CedFS M2 INT8 is not quality-approved")
+                    m2_contexts[feature.mm_hash] = variant_context
+            end = feature.position_offset + feature.position_length
+            if end > len(token_ids):
+                raise ValueError("CedFS native placeholder exceeds prompt length")
+            spans.append((feature.position_offset, end))
+            mm_hashes.setdefault(feature.modality, []).append(feature.mm_hash)
+            grid_key = (
+                "image_grid_thw"
+                if feature.modality == "image"
+                else f"{feature.modality}_grid_thw"
+            )
+            grid_item = MultiModalKwargsItem(
+                {
+                    grid_key: MultiModalFieldElem(
+                        data=torch.tensor(feature.grid_thw, dtype=torch.long),
+                        field=MultiModalBatchedField(keep_on_cpu=True),
+                    )
+                }
+            )
+            if feature.modality == "video":
+                grid_item["second_per_grid_ts"] = MultiModalFieldElem(
+                    data=torch.tensor(feature.second_per_grid_ts, dtype=torch.float32),
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                )
+            mm_kwargs.setdefault(feature.modality, []).append(grid_item)
+            mm_placeholders.setdefault(feature.modality, []).append(
+                PlaceholderRange(
+                    offset=feature.position_offset,
+                    length=feature.position_length,
+                )
+            )
+        ordered_spans = sorted(spans)
+        if any(cur[0] < prev[1] for prev, cur in zip(ordered_spans, ordered_spans[1:])):
+            raise ValueError("CedFS native multimodal placeholders overlap")
+        if m2_contexts:
+            request.ec_transfer_params = {
+                **(request.ec_transfer_params or {}),
+                "m2_contexts": m2_contexts,
+            }
+        return [], [
+            mm_input(
+                prompt_token_ids=token_ids,
+                mm_kwargs=MultiModalKwargsItems(mm_kwargs),
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+                external_cache_only=True,
+            )
+        ]
+
+    @staticmethod
+    def _validate_cedfs_m2_sample_sources(request: ChatCompletionRequest) -> None:
+        """Bind frozen M2 samples to the media actually sent to the Producer."""
+        params = request.ec_transfer_params or {}
+        samples = params.get("m2_samples")
+        sources = params.get("m2_sample_sources")
+        if not isinstance(samples, dict) or not isinstance(sources, dict):
+            raise ValueError("CedFS M2 samples and sources are required")
+        if not samples or set(samples) != set(sources):
+            raise ValueError("CedFS M2 sample/source identifiers differ")
+        if request.media_io_kwargs != {"video": {"fps": 0.5}}:
+            raise ValueError("CedFS M2 video sampling must use fps=0.5")
+        seen: set[str] = set()
+        for message in request.messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "video_url":
+                    continue
+                identifier = item.get("uuid")
+                media = item.get("video_url")
+                if (
+                    not isinstance(identifier, str)
+                    or not isinstance(media, dict)
+                    or media.get("url") != sources.get(identifier)
+                    or identifier not in samples
+                ):
+                    raise ValueError("CedFS M2 source does not match request video")
+                seen.add(identifier)
+        if seen != set(samples):
+            raise ValueError("CedFS M2 video identifiers do not match samples")
+
+    async def _verify_cedfs_m2_sample_records(
+        self,
+        request: ChatCompletionRequest,
+    ) -> None:
+        """Reject altered sampled-frame records before scheduling the request."""
+        from cedfs_ec.m2_sampling import sample_m2_video_source
+        from cedfs_ec.variant import MediaSample
+
+        transfer = getattr(
+            getattr(self.engine_client, "vllm_config", None),
+            "ec_transfer_config",
+            None,
+        )
+        if transfer is None or not transfer.get_from_extra_config("evs_m2", False):
+            raise ValueError("CedFS M2 request requires an M2 Producer")
+        expected_processor = transfer.get_from_extra_config("processor_revision", "")
+        expected_sha = transfer.get_from_extra_config(
+            "m2_preprocessor_config_sha256", ""
+        )
+        expected_fps = str(transfer.get_from_extra_config("m2_video_fps", "0.5"))
+        params = request.ec_transfer_params or {}
+        for identifier, source in params["m2_sample_sources"].items():
+            sample = MediaSample(**params["m2_samples"][identifier])
+            if sample.digest != identifier:
+                raise ValueError("CedFS M2 logical key differs from sampled video")
+            processor = json.loads(sample.processor_input_record_json)
+            if (
+                processor.get("processor_revision") != expected_processor
+                or processor.get("preprocessor_config_sha256") != expected_sha
+                or processor.get("target_fps") != expected_fps
+            ):
+                raise ValueError("CedFS M2 Processor sampling configuration differs")
+            observed = await asyncio.to_thread(
+                sample_m2_video_source,
+                source,
+                processor_revision=expected_processor,
+                preprocessor_config_sha256=expected_sha,
+                target_fps=expected_fps,
+            )
+            if observed != sample:
+                raise ValueError("CedFS M2 Producer sampled different video frames")
+
+    @staticmethod
+    def _validate_cedfs_route_token(request: ChatCompletionRequest, headers) -> None:
+        if os.getenv("CEDFS_REQUIRE_ROUTE_TOKEN", "0").lower() not in ("1", "true"):
+            return
+        token = headers.get("x-cedfs-route-token")
+        secret = os.getenv("CEDFS_ROUTE_TOKEN_SECRET", "")
+        owner_pd = os.getenv("CEDFS_PD_ID", "")
+        features = request.cedfs_mm_features or []
+        if not token:
+            raise RouteTokenError("missing CedFS route token")
+        if not secret or not owner_pd or not features:
+            raise RouteTokenError("CedFS direct-PD token context is not configured")
+        scopes = {feature.model_scope for feature in features}
+        fingerprints = {feature.compatibility_fingerprint for feature in features}
+        epochs = {feature.ownership_epoch for feature in features}
+        if len(scopes) != 1 or len(fingerprints) != 1 or len(epochs) != 1:
+            raise RouteTokenError(
+                "CedFS native features have mixed compatibility identity"
+            )
+        RouteTokenSigner(secret).verify(
+            token,
+            model=str(request.model or ""),
+            model_scope=next(iter(scopes)),
+            compatibility_fingerprint=next(iter(fingerprints)),
+            ownership_epoch=next(iter(epochs)),
+            owner_pd=owner_pd,
+            media_hashes=[feature.mm_hash for feature in features],
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:

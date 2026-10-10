@@ -13,10 +13,12 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    MultiModalConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.ec_transfer.ec_connector.base import ECCacheAvailability
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -38,7 +40,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    ECConnectorOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
@@ -114,6 +121,35 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+@pytest.mark.parametrize(
+    ("pruning_rate", "modality", "skip_prefix"),
+    [(0.5, "video", True), (0.0, "video", False), (0.5, "image", False)],
+)
+def test_evs_video_recomputes_mrope_instead_of_reusing_prefix(
+    pruning_rate: float, modality: str, skip_prefix: bool
+) -> None:
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.vllm_config.model_config.multimodal_config = MultiModalConfig(
+        video_pruning_rate=pruning_rate
+    )
+    request = create_requests(num_requests=1)[0]
+    request.mm_features = [
+        MultiModalFeatureSpec(
+            data=MultiModalKwargsItem.dummy(),
+            modality=modality,
+            identifier="media",
+            mm_position=PlaceholderRange(offset=0, length=1),
+        )
+    ]
+
+    scheduler.add_request(request)
+
+    assert request.skip_reading_prefix_cache is skip_prefix
+    assert scheduler.kv_cache_manager.prefix_cache_lookup_enabled(request) is (
+        not skip_prefix
+    )
 
 
 def test_finish_request():
@@ -3232,6 +3268,9 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
 
     scheduler.perf_metrics = None
     scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.pending_ec_loads = {}
+    scheduler._cedfs_trace_scheduled_requests = set()
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
@@ -3751,6 +3790,206 @@ def test_ec_connector_cache_miss_computes_locally(use_kv_connector):
     )
 
     # Then MODEL_RUNNER will execute the encoder and cache the result
+
+
+def test_strict_ec_pending_does_not_block_later_ready_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=200,
+        mm_hashes_list=[["pending_hash"], ["ready_hash"]],
+        mm_positions=[
+            [PlaceholderRange(offset=0, length=100)],
+            [PlaceholderRange(offset=0, length=100)],
+        ],
+    )
+    availability = {
+        "pending_hash": ECCacheAvailability.PENDING,
+        "ready_hash": ECCacheAvailability.READY,
+    }
+    scheduler.ec_connector.get_cache_availability = Mock(
+        side_effect=lambda identifier: availability[identifier]
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[1].request_id]
+    assert requests[0].request_id not in output.num_scheduled_tokens
+    assert requests[0].status == RequestStatus.WAITING
+
+    availability["pending_hash"] = ECCacheAvailability.READY
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [requests[0].request_id]
+
+
+def test_strict_ec_failed_finishes_request_without_local_encoder():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["failed_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.FAILED
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert output.scheduled_encoder_inputs == {}
+    assert request.status == RequestStatus.WAITING
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(output, model_output)
+    failure = outputs[request.client_index].outputs[0]
+    assert failure.finish_reason == FinishReason.ERROR
+    assert failure.stop_reason == "cedfs_ec_unavailable: failed_hash"
+    assert request.status == RequestStatus.FINISHED_ERROR
+
+
+def test_strict_ec_async_load_uses_transfer_only_step_before_prefill():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["async_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    staged = False
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.READY
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.ec_connector.supports_async_load = Mock(return_value=True)
+    scheduler.ec_connector.is_async_load_finished = Mock(
+        side_effect=lambda identifier: staged
+    )
+    scheduler.add_request(request)
+
+    transfer_output = scheduler.schedule()
+
+    assert transfer_output.total_num_scheduled_tokens == 0
+    assert transfer_output.scheduled_new_reqs == []
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_ECS
+    assert request.request_id in scheduler.pending_ec_loads
+
+    staged = True
+    prefill_output = scheduler.schedule()
+
+    assert prefill_output.num_scheduled_tokens[request.request_id] == 200
+    assert request.status == RequestStatus.RUNNING
+    assert request.request_id not in scheduler.pending_ec_loads
+
+
+def test_strict_ec_async_load_failure_finishes_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        enable_prefix_caching=True,
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["failed_async_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    scheduler.ec_connector.get_cache_availability = Mock(
+        return_value=ECCacheAvailability.READY
+    )
+    scheduler.ec_connector.requires_external_cache = Mock(return_value=True)
+    scheduler.ec_connector.supports_async_load = Mock(return_value=True)
+    scheduler.ec_connector.is_async_load_finished = Mock(return_value=False)
+    scheduler.add_request(request)
+
+    transfer_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_ECS
+
+    model_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        ec_connector_output=ECConnectorOutput(
+            failed_recving={"failed_async_hash": "ValueError: checksum mismatch"}
+        ),
+    )
+    outputs = scheduler.update_from_output(transfer_output, model_output)
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.pending_ec_loads
+    assert request.request_id not in scheduler.requests
+    assert outputs[0].outputs[0].finish_reason == FinishReason.ERROR
+    assert "checksum mismatch" in outputs[0].outputs[0].stop_reason
+
+
+def test_strict_ec_worker_completion_unblocks_next_prefill():
+    """Worker completion must reach the v0.27 scheduler exactly once."""
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_hashes_list=[["async_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+    )[0]
+    completed: set[str] = set()
+    connector = scheduler.ec_connector
+    connector.get_cache_availability = Mock(return_value=ECCacheAvailability.READY)
+    connector.requires_external_cache = Mock(return_value=True)
+    connector.supports_async_load = Mock(return_value=True)
+    connector.is_async_load_finished = Mock(side_effect=lambda key: key in completed)
+    connector.update_connector_output = Mock(
+        side_effect=lambda output: completed.update(output.finished_recving or ())
+    )
+    scheduler.add_request(request)
+    transfer_output = scheduler.schedule()
+    ec_output = ECConnectorOutput(finished_recving={"async_hash"})
+
+    scheduler.update_from_output(
+        transfer_output,
+        ModelRunnerOutput(
+            req_ids=[], req_id_to_index={}, ec_connector_output=ec_output
+        ),
+    )
+    connector.update_connector_output.assert_called_once_with(ec_output)
+    prefill_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert prefill_output.num_scheduled_tokens[request.request_id] == 200
+    assert request.request_id not in scheduler.pending_ec_loads
 
 
 @pytest.mark.parametrize("use_kv_connector", [False, True])
@@ -5411,6 +5650,37 @@ def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
     )
     # No local encoder compute — all loaded externally
     _assert_right_encoder_inputs(output, expected_total_reqs=0)
+
+
+def test_ec_connector_invalid_variant_fails_only_its_request():
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        use_ec_connector=True,
+        ec_role="ec_consumer",
+    )
+    invalid = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+        req_ids=["invalid-variant"],
+    )[0]
+    behind = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        req_ids=["valid-text"],
+    )[0]
+    scheduler.ec_connector.ensure_cache_available = Mock(
+        side_effect=ValueError("sample mismatch")
+    )
+    scheduler.add_request(invalid)
+    scheduler.add_request(behind)
+
+    output = scheduler.schedule()
+
+    assert invalid.request_id not in output.num_scheduled_tokens
+    assert behind.request_id in output.num_scheduled_tokens
+    assert invalid.request_id in scheduler.failed_ec_availability_reqs
+    assert invalid.stop_reason == "cedfs_ec_variant_invalid: sample mismatch"
 
 
 def test_ec_connector_pending_prefetch_only_checks_future_mm_features():
