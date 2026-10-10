@@ -346,3 +346,9 @@ class MultiModalConfig:
 
     def is_multimodal_pruning_enabled(self):
         return self.video_pruning_rate is not None and self.video_pruning_rate > 0
+
+    def get_video_pruning_spec(self) -> tuple[Literal["evs"], float] | None:
+        """Return the enabled EVS specification for encoder-cache identity."""
+        if self.video_pruning_rate is not None and self.video_pruning_rate > 0:
+            return "evs", float(self.video_pruning_rate)
+        return None

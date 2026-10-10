@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.cedfs_trace import log_cedfs_ttft_event
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -673,6 +674,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._cedfs_trace_prompt_embeddings: set[str] = set()
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1180,6 +1182,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._cedfs_trace_prompt_embeddings.discard(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2997,6 +3000,13 @@ class GPUModelRunner(
             if not mm_kwargs:
                 return []  # nothing left to encode after filtering out `prompt_embeds`
 
+        if envs.CEDFS_TRACE:
+            logger.info(
+                "vLLM MM encoder execution: item_count=%d request_count=%d",
+                len(mm_kwargs),
+                len({req_id for req_id, _ in mm_lora_refs}),
+            )
+
         should_time = bool(
             self.observability_config
             and self.observability_config.enable_mm_processor_stats
@@ -3599,6 +3609,15 @@ class GPUModelRunner(
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
 
+        if is_first_rank and is_global_first_rank():
+            for request in scheduler_output.scheduled_new_reqs:
+                if request.req_id not in self._cedfs_trace_prompt_embeddings:
+                    self._cedfs_trace_prompt_embeddings.add(request.req_id)
+                    log_cedfs_ttft_event(logger, request.req_id, "embedding_merge_done")
+                    log_cedfs_ttft_event(
+                        logger, request.req_id, "prompt_embedding_built"
+                    )
+
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
         elif self.uses_xdrope_dim > 0:
@@ -4173,10 +4192,20 @@ class GPUModelRunner(
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
+                ec_output = (
+                    self.ec_connector_no_forward(scheduler_output, self.encoder_cache)
+                    if has_ec_transfer() and get_ec_transfer().is_consumer
+                    else EMPTY_MODEL_RUNNER_OUTPUT
+                )
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return ec_output
+                kv_output = self.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+                if ec_output is EMPTY_MODEL_RUNNER_OUTPUT:
+                    return kv_output
+                ec_output.kv_connector_output = kv_output.kv_connector_output
+                return ec_output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (

@@ -21,6 +21,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
+from vllm.cedfs_trace import log_cedfs_ttft_event
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.pooler import POOLER_CONFIG_LOG_FIELDS
 from vllm.distributed import (
@@ -468,6 +469,7 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
+        log_cedfs_ttft_event(logger, request.request_id, "engine_enqueue")
         self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs

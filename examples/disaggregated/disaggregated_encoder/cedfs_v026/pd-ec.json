@@ -1,0 +1,19 @@
+{
+  "ec_connector": "CedfsECConnector",
+  "ec_role": "ec_consumer",
+  "ec_connector_module_path": "cedfs_ec.vllm_connector",
+  "ec_connector_extra_config": {
+    "cedfs_config_path": "/home/chenym/cedfs-ec/test/cedfs/single-node/client-1.toml",
+    "model_scope": "evsv0260_raw_r1",
+    "evs_m2": true,
+    "m2_codec": "evs-raw-bf16",
+    "m2_calibration_sha256": "d41c178edf05b9266bdb304fba1b3bc06b2280fe0d505a678cbb070cb2c29e12",
+    "model_revision": "qwen2.5-vl-3b-v0260-r1",
+    "processor_revision": "qwen2.5-vl-processor-v0260-r1",
+    "evs_version": "vllm0.26.0-evs-backport-r1",
+    "strict_cache_defer": true,
+    "consumer_assume_cache_exists": true,
+    "load_retry_ms": 2000,
+    "tensor_prefetch_mode": "none"
+  }
+}

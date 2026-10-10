@@ -1,0 +1,450 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import asyncio
+from dataclasses import asdict, replace
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+from cedfs_ec.route_token import RouteTokenError, RouteTokenSigner
+from cedfs_ec.variant import MediaSample
+from pydantic import ValidationError
+
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.input_processor import InputProcessor
+
+
+def _feature(**overrides):
+    value = {
+        "version": 1,
+        "mm_hash": "image-a",
+        "model_scope": "scope-a",
+        "num_encoder_tokens": 4,
+        "tensor_shape": [4, 8],
+        "tensor_dtype": "bfloat16",
+        "compatibility_fingerprint": "fingerprint-a",
+        "ownership_epoch": 7,
+        "device_key": "cuda:0",
+        "modality": "image",
+        "position_offset": 2,
+        "position_length": 4,
+        "grid_thw": [1, 2, 8],
+    }
+    value.update(overrides)
+    return value
+
+
+def _request(features=None):
+    return ChatCompletionRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "describe"}],
+            "cedfs_prompt_token_ids": list(range(12)),
+            "cedfs_mm_features": features or [_feature()],
+        }
+    )
+
+
+def _build(request, q=0.0):
+    server = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="qwen2_5_vl",
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+                text_config=SimpleNamespace(hidden_size=2048),
+            ),
+            multimodal_config=SimpleNamespace(video_pruning_rate=q),
+        )
+    )
+    return OpenAIServingChat._build_cedfs_native_inputs(server, request)
+
+
+def test_m2_producer_rejects_source_not_in_request():
+    body = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "file:///video-a.mp4"},
+                        "uuid": "sample-a",
+                    },
+                ],
+            }
+        ],
+        "media_io_kwargs": {"video": {"fps": 0.5}},
+        "ec_transfer_params": {
+            "m2_samples": {"sample-a": {"content_sha256": "placeholder"}},
+            "m2_sample_sources": {"sample-a": "file:///video-a.mp4"},
+        },
+    }
+    request = ChatCompletionRequest.model_validate(body)
+    OpenAIServingChat._validate_cedfs_m2_sample_sources(request)
+    request.ec_transfer_params["m2_sample_sources"]["sample-a"] = (
+        "file:///different-video.mp4"
+    )
+    with pytest.raises(ValueError, match="does not match request video"):
+        OpenAIServingChat._validate_cedfs_m2_sample_sources(request)
+
+
+def test_m2_producer_rejects_altered_frames_before_scheduler(monkeypatch):
+    sample = MediaSample.from_records(
+        "a" * 64,
+        {
+            "frame_indices": [0],
+            "frame_timestamps": ["0"],
+            "sampled_rgb_sha256": "b" * 64,
+        },
+        {
+            "processor_revision": "revision",
+            "preprocessor_config_sha256": "c" * 64,
+            "target_fps": "0.5",
+        },
+    )
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "file:///video.mp4"},
+                            "uuid": sample.digest,
+                        },
+                    ],
+                }
+            ],
+            "media_io_kwargs": {"video": {"fps": 0.5}},
+            "ec_transfer_params": {
+                "m2_samples": {sample.digest: asdict(sample)},
+                "m2_sample_sources": {sample.digest: "file:///video.mp4"},
+            },
+        }
+    )
+    extra = {
+        "evs_m2": True,
+        "processor_revision": "revision",
+        "m2_preprocessor_config_sha256": "c" * 64,
+        "m2_video_fps": "0.5",
+    }
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    get_from_extra_config=lambda key, default: extra.get(key, default)
+                )
+            )
+        )
+    )
+    monkeypatch.setattr(
+        "cedfs_ec.m2_sampling.sample_m2_video_source", lambda *args, **kwargs: sample
+    )
+    asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
+    monkeypatch.setattr(
+        "cedfs_ec.m2_sampling.sample_m2_video_source",
+        lambda *args, **kwargs: replace(sample, content_sha256="d" * 64),
+    )
+    with pytest.raises(ValueError, match="sampled different video frames"):
+        asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
+    extra["m2_preprocessor_config_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="Processor sampling configuration differs"):
+        asyncio.run(OpenAIServingChat._verify_cedfs_m2_sample_records(server, request))
+
+
+@pytest.fixture(autouse=True)
+def compatibility_context(monkeypatch):
+    monkeypatch.setenv("CEDFS_MODEL_SCOPES", "scope-a,scope-b")
+    monkeypatch.setenv("CEDFS_COMPATIBILITY_FINGERPRINT", "fingerprint-a")
+    monkeypatch.setenv("CEDFS_OWNERSHIP_EPOCH", "7")
+    monkeypatch.setenv("CEDFS_DEVICE_KEY", "cuda:0")
+
+
+def test_native_request_builds_cache_only_engine_input():
+    _conversation, engine_inputs = _build(_request())
+
+    assert len(engine_inputs) == 1
+    engine_input = engine_inputs[0]
+    assert engine_input["prompt_token_ids"] == list(range(12))
+    assert engine_input["external_cache_only"] is True
+    assert engine_input["mm_hashes"] == {"image": ["image-a"]}
+    grid_item = engine_input["mm_kwargs"]["image"][0]
+    assert grid_item["image_grid_thw"].data.tolist() == [1, 2, 8]
+    assert grid_item["image_grid_thw"].field.keep_on_cpu is True
+    assert engine_input["mm_placeholders"]["image"][0].offset == 2
+
+
+@pytest.mark.parametrize("external_cache_only", [False, True])
+def test_native_input_processor_preserves_external_cache_metadata(external_cache_only):
+    """The v0.27 input processor must pass cache-only features to EngineCore."""
+    _, inputs = _build(_request())
+    inputs[0]["external_cache_only"] = external_cache_only
+    processor = object.__new__(InputProcessor)
+    processor._validate_params = Mock()
+    processor._validate_lora = Mock()
+    processor._validate_model_inputs = Mock()
+    processor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            local_engines_only=False,
+        )
+    )
+    processor.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: 0)
+    processor.generation_config_fields = {}
+
+    request = processor.process_inputs(
+        "native-1", inputs[0], SamplingParams(max_tokens=4), ("generate",)
+    )
+
+    assert request.prompt_token_ids == inputs[0]["prompt_token_ids"]
+    assert len(request.mm_features) == 1
+    feature = request.mm_features[0]
+    assert feature.external_cache_only is external_cache_only
+    assert feature.mm_hash == feature.identifier == "image-a"
+    assert feature.data["image_grid_thw"].data.tolist() == [1, 2, 8]
+    assert feature.mm_position.offset == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("model_scope", "wrong", "model_scope mismatch"),
+        ("compatibility_fingerprint", "wrong", "fingerprint mismatch"),
+        ("ownership_epoch", 8, "epoch mismatch"),
+        ("device_key", "cuda:1", "device_key mismatch"),
+    ],
+)
+def test_native_request_rejects_incompatible_identity(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        _build(_request([_feature(**{field: value})]))
+
+
+def test_native_request_rejects_missing_server_context(monkeypatch):
+    monkeypatch.delenv("CEDFS_OWNERSHIP_EPOCH")
+
+    with pytest.raises(ValueError, match="context is not configured"):
+        _build(_request())
+
+
+def test_native_protocol_rejects_shape_and_token_mismatch():
+    with pytest.raises(ValidationError, match="tensor_shape"):
+        _request([_feature(tensor_shape=[4, 0])])
+    with pytest.raises(ValidationError, match="position_length"):
+        _request([_feature(position_length=3)])
+
+
+def test_native_request_supports_multi_image_and_repeated_objects():
+    request = _request(
+        [
+            _feature(mm_hash="shared", position_offset=1),
+            _feature(mm_hash="shared", position_offset=7),
+        ]
+    )
+    _conversation, engine_inputs = _build(request)
+
+    assert engine_inputs[0]["mm_hashes"] == {"image": ["shared", "shared"]}
+
+
+def test_native_request_rejects_overlapping_positions():
+    with pytest.raises(ValueError, match="overlap"):
+        _build(_request([_feature(position_offset=2), _feature(position_offset=4)]))
+
+
+def test_native_video_passes_grid_timing_and_exact_evs_shape():
+    feature = _feature(
+        mm_hash="video-a",
+        modality="video",
+        num_encoder_tokens=494,
+        tensor_shape=[494, 2052],
+        position_length=494,
+        grid_thw=[4, 26, 38],
+        second_per_grid_ts=0.5,
+        video_pruning_rate=0.5,
+    )
+    request = _request([feature])
+    request.cedfs_prompt_token_ids = list(range(600))
+
+    _conversation, engine_inputs = _build(request, q=0.5)
+
+    assert engine_inputs[0]["mm_hashes"] == {"video": ["video-a"]}
+    item = engine_inputs[0]["mm_kwargs"]["video"][0]
+    assert item["video_grid_thw"].data.tolist() == [4, 26, 38]
+    assert item["second_per_grid_ts"].data.item() == 0.5
+
+
+def test_native_video_rejects_wrong_q_or_tensor_layout():
+    feature = _feature(
+        modality="video",
+        num_encoder_tokens=494,
+        tensor_shape=[494, 2052],
+        position_length=494,
+        grid_thw=[4, 26, 38],
+        second_per_grid_ts=0.5,
+        video_pruning_rate=0.5,
+    )
+    request = _request([feature])
+    request.cedfs_prompt_token_ids = list(range(600))
+    with pytest.raises(ValueError, match="pruning rate mismatch"):
+        _build(request, q=0.75)
+
+    request.cedfs_mm_features[0].tensor_shape = [494, 2048]
+    with pytest.raises(ValueError, match="tensor/placeholder mismatch"):
+        _build(request, q=0.5)
+
+
+def test_native_video_v2_checks_frozen_variant(monkeypatch):
+    import torch
+    from cedfs_ec.evs_object import encode_video_ec_v2
+
+    monkeypatch.setenv("CEDFS_MODEL_REVISION", "weights-a")
+    monkeypatch.setenv("CEDFS_PROCESSOR_REVISION", "processor-a")
+    monkeypatch.setenv("CEDFS_EVS_VERSION", "evs-a")
+    _, descriptor = encode_video_ec_v2(
+        "video-a",
+        torch.zeros((4, 2052), dtype=torch.bfloat16),
+        {
+            "model_revision": "weights-a",
+            "processor_revision": "processor-a",
+            "evs_version": "evs-a",
+            "q": 0.5,
+            "grid_thw": [2, 4, 4],
+            "second_per_grid_ts": 0.25,
+            "spatial_merge_size": 2,
+            "producer_id": "edge-a",
+            "model_scope": "scope-a",
+        },
+    )
+    feature = _feature(
+        version=2,
+        mm_hash="video-a",
+        modality="video",
+        num_encoder_tokens=4,
+        tensor_shape=[4, 2052],
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        video_pruning_rate=0.5,
+        semantic_variant=descriptor["semantic_variant"],
+        physical_variant=descriptor["physical_variant"],
+    )
+    # The descriptor above used a different sampling time and must be rejected even
+    # though the row count and frozen revisions agree.
+    with pytest.raises(ValueError, match="variant mismatch"):
+        _build(_request([feature]), q=0.5)
+
+
+def test_native_m2_video_passes_frozen_context_to_scheduler(monkeypatch):
+    import hashlib
+
+    from cedfs_ec.variant import MediaSample, build_video_context, context_to_dict
+
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    sample = MediaSample.from_records(
+        digest("media"),
+        {
+            "frame_indices": [0, 1],
+            "frame_timestamps": ["0", "0.5"],
+            "sampled_rgb_sha256": digest("frames"),
+        },
+        {"processor_revision": "processor-a"},
+    )
+    context = build_video_context(
+        mm_hash="placeholder",
+        sample=sample,
+        model_revision="weights-a",
+        processor_revision="processor-a",
+        evs_version="evs-a",
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        spatial_merge_size=2,
+        codec_id="evs-raw-bf16",
+        calibration_sha256=digest("config"),
+        original_dtype="bfloat16",
+    )
+    context = build_video_context(
+        mm_hash=context.storage_key,
+        sample=sample,
+        model_revision="weights-a",
+        processor_revision="processor-a",
+        evs_version="evs-a",
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        spatial_merge_size=2,
+        codec_id="evs-raw-bf16",
+        calibration_sha256=digest("config"),
+        original_dtype="bfloat16",
+    )
+    monkeypatch.setenv("CEDFS_MODEL_REVISION", "weights-a")
+    monkeypatch.setenv("CEDFS_PROCESSOR_REVISION", "processor-a")
+    monkeypatch.setenv("CEDFS_EVS_VERSION", "evs-a")
+    feature = _feature(
+        version=3,
+        mm_hash=context.storage_key,
+        modality="video",
+        num_encoder_tokens=4,
+        tensor_shape=[4, 2052],
+        position_length=4,
+        grid_thw=[2, 4, 4],
+        second_per_grid_ts=0.5,
+        video_pruning_rate=0.5,
+        semantic_variant=context.semantic.digest,
+        physical_variant=context.storage_key,
+        variant_context=context_to_dict(context),
+    )
+    request = _request([feature])
+    _conversation, inputs = _build(request, q=0.5)
+    assert inputs[0]["mm_hashes"] == {"video": [context.storage_key]}
+    assert request.ec_transfer_params["m2_contexts"][
+        context.storage_key
+    ] == context_to_dict(context)
+
+
+def test_direct_pd_route_token_is_required_and_bound(monkeypatch):
+    secret = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CEDFS_REQUIRE_ROUTE_TOKEN", "1")
+    monkeypatch.setenv("CEDFS_ROUTE_TOKEN_SECRET", secret)
+    monkeypatch.setenv("CEDFS_PD_ID", "1")
+    token, _claims = RouteTokenSigner(secret).issue(
+        model="test",
+        model_scope="scope-a",
+        compatibility_fingerprint="fingerprint-a",
+        ownership_epoch=7,
+        owner_pd="1",
+        media_hashes=["image-a"],
+    )
+
+    OpenAIServingChat._validate_cedfs_route_token(
+        _request(), {"x-cedfs-route-token": token}
+    )
+    with pytest.raises(RouteTokenError, match="missing"):
+        OpenAIServingChat._validate_cedfs_route_token(_request(), {})
+
+
+def test_direct_pd_rejects_wrong_owner_and_tampering(monkeypatch):
+    secret = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CEDFS_REQUIRE_ROUTE_TOKEN", "1")
+    monkeypatch.setenv("CEDFS_ROUTE_TOKEN_SECRET", secret)
+    monkeypatch.setenv("CEDFS_PD_ID", "0")
+    token, _claims = RouteTokenSigner(secret).issue(
+        model="test",
+        model_scope="scope-a",
+        compatibility_fingerprint="fingerprint-a",
+        ownership_epoch=7,
+        owner_pd="1",
+        media_hashes=["image-a"],
+    )
+
+    with pytest.raises(RouteTokenError, match="owner_pd mismatch"):
+        OpenAIServingChat._validate_cedfs_route_token(
+            _request(), {"x-cedfs-route-token": token}
+        )
+    with pytest.raises(RouteTokenError, match="signature"):
+        OpenAIServingChat._validate_cedfs_route_token(
+            _request(), {"x-cedfs-route-token": token[:-1] + "A"}
+        )

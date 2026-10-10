@@ -8,6 +8,13 @@ from vllm.config.multimodal import MultiModalConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
+@pytest.mark.parametrize("rate", [None, 0.0, 0.5, 0.75])
+def test_video_pruning_spec_matches_encoder_cache_identity(rate):
+    config = MultiModalConfig(video_pruning_rate=rate)
+    expected = ("evs", rate) if rate is not None and rate > 0 else None
+    assert config.get_video_pruning_spec() == expected
+
+
 def test_mm_encoder_attn_backend_str_conversion():
     config = MultiModalConfig(mm_encoder_attn_backend="FLASH_ATTN")
     assert config.mm_encoder_attn_backend == AttentionBackendEnum.FLASH_ATTN

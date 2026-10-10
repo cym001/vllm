@@ -28,6 +28,19 @@ def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert not hasattr(envs.__getattr__, "cache_info")
 
 
+def test_cedfs_trace_defaults_off_and_accepts_boolean_values(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("CEDFS_TRACE", raising=False)
+    assert envs.CEDFS_TRACE is False
+
+    monkeypatch.setenv("CEDFS_TRACE", "true")
+    assert envs.CEDFS_TRACE is True
+
+    monkeypatch.setenv("CEDFS_TRACE", "1")
+    assert envs.CEDFS_TRACE is True
+
+
 def test_nixl_side_channel_host_is_not_compile_factor(
     monkeypatch: pytest.MonkeyPatch,
 ):
